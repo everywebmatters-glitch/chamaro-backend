@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
-import type { AdminService } from "./admin.service.js";
-import type { CreateAdminInput } from "./admin.types.js";
+import type { AdminService } from "../services/admin.service.js";
+import type { CreateAdminInput } from "../types/admin.types.js";
 
 export function createAdminController(service: AdminService) {
   return {

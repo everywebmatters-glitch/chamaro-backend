@@ -5,13 +5,13 @@ import prismaPlugin from "./plugins/prisma.js";
 import authPlugin from "./plugins/auth.js";
 import { requireAdmin, requireCustomer } from "./middleware/auth.middleware.js";
 import { registerErrorHandler } from "./middleware/error.middleware.js";
-import { healthRoutes } from "./health/health.routes.js";
-import { authRoutes } from "./modules/auth/auth.routes.js";
-import { adminRoutes } from "./modules/admin/admin.routes.js";
-import { productRoutes } from "./modules/products/product.routes.js";
-import { categoryRoutes } from "./modules/categories/category.routes.js";
-import { cmsRoutes } from "./modules/cms/cms.routes.js";
-import { mediaRoutes } from "./modules/media/media.routes.js";
+import { healthRoutes } from "./routes/health.routes.js";
+import { authRoutes } from "./routes/auth.routes.js";
+import { adminRoutes } from "./routes/admin.routes.js";
+import { productRoutes } from "./routes/product.routes.js";
+import { categoryRoutes } from "./routes/category.routes.js";
+import { cmsRoutes } from "./routes/cms.routes.js";
+import { mediaRoutes } from "./routes/media.routes.js";
 
 export async function buildApp() {
   // Fastify's AJV defaults to removeAdditional: true, which silently strips properties that

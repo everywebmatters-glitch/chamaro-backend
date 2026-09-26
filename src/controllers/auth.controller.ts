@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { env } from "../../config/env.js";
-import type { AuthService } from "./auth.service.js";
-import type { AdminLoginInput, AuthenticatedUser, LoginInput, RegisterInput, Role, SafeUser } from "./auth.types.js";
+import { env } from "../config/env.js";
+import type { AuthService } from "../services/auth.service.js";
+import type { AdminLoginInput, AuthenticatedUser, LoginInput, RegisterInput, Role, SafeUser } from "../types/auth.types.js";
 import {
   clearedStateCookie,
   createExchangeCode,
@@ -10,7 +10,7 @@ import {
   stateCookie,
   verifyExchangeCode,
   verifyOAuthState,
-} from "./google-oauth.tokens.js";
+} from "../utils/google-oauth.tokens.js";
 
 async function issueToken(reply: FastifyReply, user: { id: string; name: string; email: string; role: Role }) {
   const token = await reply.jwtSign({ role: user.role }, { sign: { sub: user.id } });
