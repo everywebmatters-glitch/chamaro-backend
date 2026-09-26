@@ -1,22 +1,49 @@
 {
-  "name": "backend",
+  "name": "chamaro-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Chamaro Ecommerce and CMS Backend",
+  "main": "dist/src/server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "tsx watch src/server.ts",
+    "staging": "cross-env APP_ENV=staging tsx src/server.ts",
+    "build": "tsc",
+    "test": "tsx --test tests/integration/**/*.test.ts",
+    "admin:create": "tsx src/scripts/create-admin.ts",
+    "admin:promote": "tsx src/scripts/promote-admin.ts",
+    "admin:delete": "tsx src/scripts/delete-admin.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:validate": "prisma validate",
+    "prisma:seed": "tsx prisma/seed.ts",
+    "production": "cross-env APP_ENV=production node dist/src/server.js",
+    "start": "node dist/src/server.js"
   },
-  "keywords": [],
+  "keywords": [
+    "chamaro",
+    "ecommerce",
+    "cms",
+    "fastify"
+  ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
     "@fastify/cors": "^11.3.0",
     "@fastify/env": "^7.0.0",
-    "fastify": "^5.12.1"
+    "@fastify/jwt": "^10.0.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/swagger": "^9.8.1",
+    "@fastify/swagger-ui": "^6.1.1",
+    "@prisma/adapter-mariadb": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "dotenv": "^17.4.2",
+    "fastify": "^5.12.1",
+    "fastify-plugin": "^5.0.0",
+    "google-auth-library": "^9.15.1"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
+    "cross-env": "^10.0.0",
+    "prisma": "^7.10.0",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   }
