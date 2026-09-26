@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
-import { createAdminRouteSchema } from "./admin.schema.js";
-import { createAdminService } from "./admin.service.js";
-import { createAdminController } from "./admin.controller.js";
+import { createAdminRouteSchema } from "../schemas/admin.schema.js";
+import { createAdminService } from "../services/admin.service.js";
+import { createAdminController } from "../controllers/admin.controller.js";
 
 export const adminRoutes: FastifyPluginAsync = async (app) => {
   const controller = createAdminController(createAdminService(app.prisma));

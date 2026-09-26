@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FastifyPluginAsync } from "fastify";
-import { idParams, notFound, pageMeta, routeSchema } from "../shared.js";
+import { idParams, notFound, pageMeta, routeSchema } from "../shared/http.js";
 const body = { type: "object", required: ["url", "filename", "mimeType"], properties: { url: { type: "string", format: "uri" }, filename: { type: "string", maxLength: 500 }, altText: { type: "string", maxLength: 500 }, mimeType: { type: "string", maxLength: 191 }, metadata: { type: "object" } } };
 const hashUrl = (url: string) => createHash("sha256").update(url).digest("hex");
 export const mediaRoutes: FastifyPluginAsync = async (app) => {

@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { env } from "../../config/env.js";
+import { env } from "../config/env.js";
 import {
   adminLoginRouteSchema,
   customerMeRouteSchema,
@@ -9,9 +9,9 @@ import {
   loginRouteSchema,
   meRouteSchema,
   registerRouteSchema,
-} from "./auth.schema.js";
-import { createAuthService } from "./auth.service.js";
-import { createAuthController } from "./auth.controller.js";
+} from "../schemas/auth.schema.js";
+import { createAuthService } from "../services/auth.service.js";
+import { createAuthController } from "../controllers/auth.controller.js";
 
 const authRateLimit = { config: { rateLimit: { max: env.AUTH_RATE_LIMIT_MAX, timeWindow: env.AUTH_RATE_LIMIT_WINDOW } } };
 

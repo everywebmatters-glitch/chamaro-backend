@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
-import { idParams, notFound, pageMeta, paginationQuery, routeSchema } from "../shared.js";
-import { normalizeSlug } from "../../shared/slug.js";
+import { idParams, notFound, pageMeta, paginationQuery, routeSchema } from "../shared/http.js";
+import { normalizeSlug } from "../shared/slug.js";
 const body = { type: "object", additionalProperties: false, required: ["name", "slug"], properties: { name: { type: "string", minLength: 1, maxLength: 191 }, slug: { type: "string", minLength: 1, maxLength: 191 }, description: { type: "string", maxLength: 10000 }, status: { type: "string", enum: ["DRAFT", "ACTIVE", "ARCHIVED"] } } };
 
 export const categoryRoutes: FastifyPluginAsync = async (app) => {
