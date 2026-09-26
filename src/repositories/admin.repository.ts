@@ -1,4 +1,4 @@
-import type { PrismaClient } from "../../../generated/prisma/client.js";
+import type { PrismaClient } from "../../generated/prisma/client.js";
 
 const safeAdminSelect = { id: true, name: true, email: true, role: true, isActive: true, createdAt: true } as const;
 

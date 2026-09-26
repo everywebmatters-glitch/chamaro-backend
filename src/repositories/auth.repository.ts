@@ -1,5 +1,5 @@
-import type { PrismaClient } from "../../../generated/prisma/client.js";
-import { GOOGLE_OAUTH_NO_PASSWORD } from "../../utils/password.js";
+import type { PrismaClient } from "../../generated/prisma/client.js";
+import { GOOGLE_OAUTH_NO_PASSWORD } from "../utils/password.js";
 
 const safeUserSelect = { id: true, name: true, email: true, role: true, isActive: true, createdAt: true } as const;
 
