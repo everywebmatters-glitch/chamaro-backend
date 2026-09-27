@@ -1,5 +1,5 @@
 import type { PrismaClient } from "../../generated/prisma/client.js";
-import { verifyPassword, hashPassword } from "../utils/password.js";
+import { hashPassword, verifyPasswordConstantWork } from "../utils/password.js";
 import { createAuthRepository } from "../repositories/auth.repository.js";
 import { googleProvider } from "../providers/google.provider.js";
 import type { AdminLoginInput, GoogleIdentity, LoginInput, RegisterInput, SafeUser } from "../types/auth.types.js";
@@ -43,10 +43,13 @@ export function createAuthService(prisma: PrismaClient) {
     async login(input: LoginInput) {
       const email = input.email.trim().toLowerCase();
       const user = await repository.findByEmail(email);
+      // The password check always runs one scrypt (against a dummy hash when there's no account
+      // or no local password), so response time doesn't reveal whether the email exists.
+      const passwordMatches = await verifyPasswordConstantWork(input.password, user?.passwordHash);
       // Single generic failure for every case (no account, wrong password, inactive account,
       // Google-only account, or an ADMIN account attempting the customer endpoint) so the
       // response never discloses which of those applies.
-      if (!user || !user.isActive || user.role !== "CUSTOMER" || !(await verifyPassword(input.password, user.passwordHash))) {
+      if (!user || !passwordMatches || !user.isActive || user.role !== "CUSTOMER") {
         throw invalidCredentials();
       }
       return user;
@@ -55,7 +58,9 @@ export function createAuthService(prisma: PrismaClient) {
     async adminLogin(input: AdminLoginInput) {
       const email = input.email.trim().toLowerCase();
       const user = await repository.findByEmail(email);
-      if (!user || !user.isActive || user.role !== "ADMIN" || !(await verifyPassword(input.password, user.passwordHash))) {
+      // Same constant-work check as customer login (see above).
+      const passwordMatches = await verifyPasswordConstantWork(input.password, user?.passwordHash);
+      if (!user || !passwordMatches || !user.isActive || user.role !== "ADMIN") {
         throw invalidCredentials();
       }
       await repository.recordAdminLogin(user.id);

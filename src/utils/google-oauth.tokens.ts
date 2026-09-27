@@ -42,7 +42,7 @@ function oauthError(message: string, code: string): Error {
 export function createOAuthState(app: FastifyInstance, codeChallenge: string): { state: string; nonce: string } {
   const nonce = randomBytes(32).toString("base64url");
   const payload: StatePayload = { purpose: "google_oauth_state", nonce: sha256(nonce), cc: codeChallenge };
-  const state = app.jwt.sign(payload, { key: derivedKey("google-oauth-state"), expiresIn: `${STATE_TTL_SECONDS}s` });
+  const state = app.jwt.sign(payload, { key: derivedKey("google-oauth-state"), algorithm: "HS256", expiresIn: `${STATE_TTL_SECONDS}s` });
   return { state, nonce };
 }
 
@@ -51,20 +51,20 @@ export function verifyOAuthState(app: FastifyInstance, state: string | undefined
   const invalid = () => oauthError("Invalid or expired OAuth state", "OAUTH_STATE_INVALID");
   if (!state || !cookieNonce) throw invalid();
   let payload: StatePayload;
-  try { payload = app.jwt.verify<StatePayload>(state, { key: derivedKey("google-oauth-state") }); } catch { throw invalid(); }
+  try { payload = app.jwt.verify<StatePayload>(state, { key: derivedKey("google-oauth-state"), algorithms: ["HS256"] }); } catch { throw invalid(); }
   if (payload.purpose !== "google_oauth_state" || !safeEqual(payload.nonce, sha256(cookieNonce))) throw invalid();
   return payload.cc;
 }
 
 export function createExchangeCode(app: FastifyInstance, userId: string, codeChallenge: string): string {
-  return app.jwt.sign({ purpose: "google_exchange_code", cc: codeChallenge }, { key: derivedKey("google-exchange-code"), sub: userId, expiresIn: "60s" });
+  return app.jwt.sign({ purpose: "google_exchange_code", cc: codeChallenge }, { key: derivedKey("google-exchange-code"), algorithm: "HS256", sub: userId, expiresIn: "60s" });
 }
 
 // Returns the user ID the code was issued for.
 export function verifyExchangeCode(app: FastifyInstance, code: string, codeVerifier: string): string {
   const invalid = () => oauthError("Invalid or expired sign-in code", "OAUTH_CODE_INVALID");
   let payload: ExchangePayload;
-  try { payload = app.jwt.verify<ExchangePayload>(code, { key: derivedKey("google-exchange-code") }); } catch { throw invalid(); }
+  try { payload = app.jwt.verify<ExchangePayload>(code, { key: derivedKey("google-exchange-code"), algorithms: ["HS256"] }); } catch { throw invalid(); }
   if (payload.purpose !== "google_exchange_code" || !payload.sub || !safeEqual(payload.cc, sha256(codeVerifier))) throw invalid();
   return payload.sub;
 }
