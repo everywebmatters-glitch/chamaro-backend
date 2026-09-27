@@ -89,6 +89,13 @@ model Product {
   name              String
   slug              String             @unique @db.VarChar(191)
   description       String?            @db.Text
+  // Storefront product-page tabs. Lists are JSON arrays of strings; specifications is
+  // [{ label, value }]. Empty returnPolicy/warranty mean "use the store-wide default".
+  features          Json?
+  materials         Json?
+  specifications    Json?
+  returnPolicy      String?            @db.Text
+  warranty          String?            @db.Text
   price             Decimal            @db.Decimal(12, 2)
   compareAtPrice    Decimal?           @db.Decimal(12, 2)
   sku               String?            @unique @db.VarChar(191)
@@ -109,19 +116,25 @@ model Product {
   @@index([name])
 }
 
+// An image shown on a product. New images reference an uploaded Media record (mediaId), whose
+// bytes the API serves at /api/v1/media/:id. `url` only holds legacy externally hosted images.
 model ProductImage {
   id        String   @id @default(cuid())
   productId String
-  url       String   @db.VarChar(2048)
+  mediaId   String?
+  url       String?  @db.VarChar(2048)
   altText   String?  @db.VarChar(500)
   position  Int      @default(0)
   isPrimary Boolean  @default(false)
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  // Restrict: media still shown on a product can't be deleted (409 RECORD_IN_USE).
+  media     Media?   @relation(fields: [mediaId], references: [id], onDelete: Restrict)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([productId, position])
   @@index([productId, isPrimary])
+  @@index([mediaId])
 }
 
 model ProductVariant {
@@ -203,16 +216,22 @@ model Banner {
   @@index([pageId])
 }
 
+// A media file. Uploaded files are stored here (`data`, `size`) and served by the API;
+// externally hosted files registered earlier only have `url`/`urlHash`.
+// Queries must omit `data` except the media-serving route, so lists never load blobs.
 model Media {
-  id        String   @id @default(cuid())
-  url       String   @db.VarChar(2048)
-  urlHash   String   @unique @db.Char(64)
-  filename  String   @db.VarChar(500)
-  altText   String?  @db.VarChar(500)
-  mimeType  String   @db.VarChar(191)
-  metadata  Json?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id            String         @id @default(cuid())
+  url           String?        @db.VarChar(2048)
+  urlHash       String?        @unique @db.Char(64)
+  filename      String         @db.VarChar(500)
+  altText       String?        @db.VarChar(500)
+  mimeType      String         @db.VarChar(191)
+  size          Int?
+  data          Bytes?         @db.MediumBlob
+  metadata      Json?
+  productImages ProductImage[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
 
   @@index([mimeType])
 }
