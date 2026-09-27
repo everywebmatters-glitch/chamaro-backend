@@ -72,7 +72,10 @@ export function createAuthController(service: AuthService) {
         return reply.redirect(frontendCallbackUrl({ code: createExchangeCode(request.server, user.id, codeChallenge) }));
       } catch (failure) {
         const failureCode = (failure as { code?: unknown }).code;
-        request.log.warn({ err: failure }, "Google sign-in failed");
+        // Log only what identifies the failure: errors from google-auth-library carry the token
+        // request (client secret, authorization code) in their `config`, which must not reach logs.
+        const { name, message } = failure instanceof Error ? failure : { name: "Error", message: String(failure) };
+        request.log.warn({ err: { name, message, code: failureCode } }, "Google sign-in failed");
         const safeCode = typeof failureCode === "string" && GOOGLE_CALLBACK_ERRORS.has(failureCode) ? failureCode : "GOOGLE_AUTH_FAILED";
         return reply.redirect(frontendCallbackUrl({ error: safeCode }));
       }
