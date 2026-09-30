@@ -45,6 +45,28 @@ function tcpProbe(host: string, port: number): Promise<{ ok: true; ms: number } 
 
 type PeerCertificateResult = Record<string, unknown>;
 
+// Describes the CA exactly as getDatabaseSslOptions() produced it. Node's TLS silently ignores a
+// CA it cannot parse as PEM, so when parsing fails the layout is reported (never the contents).
+function describeConfiguredCa(ca: Buffer | undefined): Record<string, unknown> | null {
+  if (!ca) return null;
+  const text = ca.toString("utf8");
+  const layout = {
+    bytes: ca.length,
+    lines: text.split("\n").length,
+    certificates: (text.match(/-----BEGIN CERTIFICATE-----/g) ?? []).length,
+    startsWithBeginLine: text.startsWith("-----BEGIN CERTIFICATE-----"),
+    beginLineEndsWithNewline: /-----BEGIN CERTIFICATE-----\r?\n/.test(text),
+    containsCarriageReturns: text.includes("\r"),
+    containsQuotes: /["']/.test(text),
+  };
+  try {
+    const cert = new X509Certificate(ca);
+    return { parsed: true, subject: cert.subject, fingerprint256: cert.fingerprint256, valid_from: cert.validFrom, valid_to: cert.validTo, ...layout };
+  } catch (error) {
+    return { parsed: false, parseError: error instanceof Error ? error.message : String(error), ...layout };
+  }
+}
+
 // Reads the certificate the server presents in the MySQL TLS upgrade: waits for the plaintext
 // greeting, sends an SSLRequest packet (no username, password or query), completes the TLS
 // handshake, records the certificate and closes. Verification is not aborted here only so the
@@ -144,11 +166,11 @@ export async function runDatabaseDiagnostic(): Promise<void> {
   log("tcp", { ok: true, ms: tcp.ms });
 
   if (ssl) {
-    const configuredCa = ssl.ca ? new X509Certificate(ssl.ca) : undefined;
-    log("tlsPeerCertificate", {
-      configuredCa: configuredCa ? { subject: configuredCa.subject, fingerprint256: configuredCa.fingerprint256, valid_from: configuredCa.validFrom, valid_to: configuredCa.validTo } : null,
-      ...(await peerCertificateProbe(host, port, ssl.ca)),
-    });
+    try {
+      log("tlsPeerCertificate", { configuredCa: describeConfiguredCa(ssl.ca), ...(await peerCertificateProbe(host, port, ssl.ca)) });
+    } catch (error) {
+      log("tlsPeerCertificate", { ok: false, error: describeError(error, scrub) });
+    }
   }
 
   // MariaDB driver directly: authentication, TLS and unknown-database errors keep their own codes here.
