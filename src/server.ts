@@ -40,6 +40,8 @@ async function main(): Promise<void> {
     try {
       const address = await app.listen({ port: env.PORT, host: env.HOST });
       diagnostic("listen succeeded", { address });
+      // TEMPORARY (P2028 investigation): background database connectivity check; never blocks or stops the server.
+      void import("./diagnostics/database-connectivity.js").then((m) => m.runDatabaseDiagnostic()).catch((error) => console.error(JSON.stringify({ dbDiagnostic: "crashed", message: String(error?.message ?? error) })));
     } catch (error) {
       app.log.error(error);
       throw error;
