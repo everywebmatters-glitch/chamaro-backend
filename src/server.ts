@@ -24,25 +24,31 @@ diagnostic("environment", {
   GOOGLE_FRONTEND_CALLBACK_URL_set: isSet("GOOGLE_FRONTEND_CALLBACK_URL"),
 });
 
+// Startup runs inside main() because Hostinger's launcher loads this entry with require(), which
+// rejects ES modules that use top-level await (ERR_REQUIRE_ASYNC_MODULE).
 // Dynamic imports so config validation that throws while config/env.ts loads (e.g. CORS_ORIGIN
 // in production) is caught and reported below instead of crashing before any output.
-let stage = "load config";
-try {
-  const { env } = await import("./config/env.js");
-  stage = "build app";
-  const { buildApp } = await import("./app.js");
-  const app = await buildApp();
-  stage = "listen";
-  diagnostic("listen attempt", { host: env.HOST, port: env.PORT });
+async function main(): Promise<void> {
+  let stage = "load config";
   try {
-    const address = await app.listen({ port: env.PORT, host: env.HOST });
-    diagnostic("listen succeeded", { address });
+    const { env } = await import("./config/env.js");
+    stage = "build app";
+    const { buildApp } = await import("./app.js");
+    const app = await buildApp();
+    stage = "listen";
+    diagnostic("listen attempt", { host: env.HOST, port: env.PORT });
+    try {
+      const address = await app.listen({ port: env.PORT, host: env.HOST });
+      diagnostic("listen succeeded", { address });
+    } catch (error) {
+      app.log.error(error);
+      throw error;
+    }
   } catch (error) {
-    app.log.error(error);
-    throw error;
+    const failure = error instanceof Error ? error : new Error(String(error));
+    console.error(JSON.stringify({ startupDiagnostic: "startup failed", stage, message: failure.message, stack: failure.stack }));
+    process.exit(1);
   }
-} catch (error) {
-  const failure = error instanceof Error ? error : new Error(String(error));
-  console.error(JSON.stringify({ startupDiagnostic: "startup failed", stage, message: failure.message, stack: failure.stack }));
-  process.exit(1);
 }
+
+void main();
