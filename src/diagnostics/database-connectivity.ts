@@ -2,6 +2,8 @@
 // its one call in server.ts once resolved. Logs host, port, database name and TLS settings only:
 // never the URL, username or password, which are also scrubbed from every logged error message.
 import { connect as tcpConnect } from "node:net";
+import { connect as tlsConnect, checkServerIdentity as tlsCheckServerIdentity, type TLSSocket } from "node:tls";
+import { X509Certificate } from "node:crypto";
 import mariadb from "mariadb";
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
 import { PrismaClient } from "../../generated/prisma/client.js";
@@ -41,6 +43,73 @@ function tcpProbe(host: string, port: number): Promise<{ ok: true; ms: number } 
   });
 }
 
+type PeerCertificateResult = Record<string, unknown>;
+
+// Reads the certificate the server presents in the MySQL TLS upgrade: waits for the plaintext
+// greeting, sends an SSLRequest packet (no username, password or query), completes the TLS
+// handshake, records the certificate and closes. Verification is not aborted here only so the
+// failing certificate can be read; the handshake is still checked against the configured CA and
+// reported as authorized/authorizationError. The application's connection is unaffected.
+function peerCertificateProbe(host: string, port: number, ca: Buffer | undefined): Promise<PeerCertificateResult> {
+  return new Promise((resolve) => {
+    const socket = tcpConnect({ host, port });
+    let settled = false;
+    let secure: TLSSocket | undefined;
+    // Once TLS wraps the socket, only the TLS socket may be destroyed (destroying the raw socket
+    // underneath it crashes Node).
+    const finish = (result: PeerCertificateResult) => { if (!settled) { settled = true; (secure ?? socket).destroy(); resolve(result); } };
+    socket.setTimeout(TCP_TIMEOUT_MS * 2, () => finish({ ok: false, error: { code: "PROBE_TIMEOUT", message: "No TLS handshake result in time" } }));
+    socket.once("error", (error) => finish({ ok: false, stage: "tcp", error: describeError(error, (text) => text) }));
+    let greeting = Buffer.alloc(0);
+    const onData = (chunk: Buffer) => {
+      greeting = Buffer.concat([greeting, chunk]);
+      if (greeting.length < 4) return;
+      const length = greeting.readUIntLE(0, 3);
+      if (greeting.length < 4 + length) return;
+      socket.off("data", onData);
+      const payload = greeting.subarray(4, 4 + length);
+      if (payload[0] === 0xff) {
+        finish({ ok: false, stage: "greeting", error: { code: "SERVER_ERROR_PACKET", errno: payload.readUInt16LE(1), message: payload.subarray(3).toString("utf8") } });
+        return;
+      }
+      // Protocol v10: version string, then connection id (4), auth data (8), filler (1), capability flags (2).
+      const capabilitiesOffset = payload.indexOf(0, 1) + 1 + 4 + 8 + 1;
+      const CLIENT_SSL = 0x0800;
+      if ((payload.readUInt16LE(capabilitiesOffset) & CLIENT_SSL) === 0) {
+        finish({ ok: false, stage: "greeting", error: { code: "SERVER_NO_TLS", message: "Server does not offer TLS" } });
+        return;
+      }
+      const sslRequest = Buffer.alloc(4 + 32);
+      sslRequest.writeUIntLE(32, 0, 3);
+      sslRequest[3] = 1; // sequence id
+      sslRequest.writeUInt32LE(0x0800 | 0x0200 | 0x8000 | 0x0001, 4); // SSL, PROTOCOL_41, SECURE_CONNECTION, LONG_PASSWORD
+      sslRequest.writeUInt32LE(16 * 1024 * 1024, 8);
+      sslRequest[12] = 45; // utf8mb4_general_ci
+      socket.write(sslRequest);
+      const tlsSocket = tlsConnect({ socket, ca, rejectUnauthorized: false });
+      secure = tlsSocket;
+      tlsSocket.on("error", (error) => finish({ ok: false, stage: "tls", error: describeError(error, (text) => text) }));
+      tlsSocket.once("secureConnect", () => {
+        const cert = tlsSocket.getPeerCertificate();
+        const identityError = cert && Object.keys(cert).length > 0 ? tlsCheckServerIdentity(host, cert) : undefined;
+        finish({
+          ok: true,
+          authorized: tlsSocket.authorized,
+          authorizationError: tlsSocket.authorizationError ?? null,
+          subject: cert?.subject ?? null,
+          issuer: cert?.issuer ?? null,
+          valid_from: cert?.valid_from ?? null,
+          valid_to: cert?.valid_to ?? null,
+          fingerprint256: cert?.fingerprint256 ?? null,
+          // Hostname/IP check the MariaDB driver runs after the CA check passes.
+          identityCheck: identityError ? identityError.message : "passes",
+        });
+      });
+    };
+    socket.on("data", onData);
+  });
+}
+
 export async function runDatabaseDiagnostic(): Promise<void> {
   let url: URL;
   try {
@@ -73,6 +142,14 @@ export async function runDatabaseDiagnostic(): Promise<void> {
     return;
   }
   log("tcp", { ok: true, ms: tcp.ms });
+
+  if (ssl) {
+    const configuredCa = ssl.ca ? new X509Certificate(ssl.ca) : undefined;
+    log("tlsPeerCertificate", {
+      configuredCa: configuredCa ? { subject: configuredCa.subject, fingerprint256: configuredCa.fingerprint256, valid_from: configuredCa.validFrom, valid_to: configuredCa.validTo } : null,
+      ...(await peerCertificateProbe(host, port, ssl.ca)),
+    });
+  }
 
   // MariaDB driver directly: authentication, TLS and unknown-database errors keep their own codes here.
   const driverStarted = Date.now();
