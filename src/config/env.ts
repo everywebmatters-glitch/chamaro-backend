@@ -38,6 +38,8 @@ export const env = {
   CORS_ORIGIN: isProduction ? productionCorsOrigin() : process.env.CORS_ORIGIN ?? "http://localhost:3000",
   SWAGGER_SERVER_URL: process.env.SWAGGER_SERVER_URL,
   DATABASE_CA_CERT_PATH: process.env.DATABASE_CA_CERT_PATH,
+  // PEM contents of the database server CA, for hosts where no certificate file is deployed.
+  DATABASE_CA_CERT: process.env.DATABASE_CA_CERT,
   AUTH_RATE_LIMIT_MAX: Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10),
   AUTH_RATE_LIMIT_WINDOW: process.env.AUTH_RATE_LIMIT_WINDOW ?? "1 minute",
   get GOOGLE_CLIENT_ID() { return required("GOOGLE_CLIENT_ID"); },

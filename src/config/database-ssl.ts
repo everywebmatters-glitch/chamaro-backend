@@ -14,8 +14,24 @@ export function getDatabaseSslOptions(
   if (LOOPBACK_HOSTS.has(hostname)) {
     return undefined;
   }
-  if (!env.DATABASE_CA_CERT_PATH) {
-    return { rejectUnauthorized: true };
+  const ca = getDatabaseCa();
+  return ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true };
+}
+
+/**
+ * The CA that signs the database server certificate (Cloud SQL uses its own, which Node does not
+ * trust by default). DATABASE_CA_CERT (PEM contents) wins over DATABASE_CA_CERT_PATH (a file).
+ * Hosting panels that store single-line values often keep newlines as literal "\n"; those are
+ * restored. Errors name the variable, never its contents.
+ */
+function getDatabaseCa(): Buffer | undefined {
+  const pem = env.DATABASE_CA_CERT?.trim();
+  if (pem) {
+    const restored = pem.replace(/\\n/g, "\n");
+    if (!restored.includes("-----BEGIN CERTIFICATE-----")) {
+      throw new Error("DATABASE_CA_CERT must contain a PEM certificate (-----BEGIN CERTIFICATE-----)");
+    }
+    return Buffer.from(restored);
   }
-  return { rejectUnauthorized: true, ca: readFileSync(env.DATABASE_CA_CERT_PATH) };
+  return env.DATABASE_CA_CERT_PATH ? readFileSync(env.DATABASE_CA_CERT_PATH) : undefined;
 }

@@ -65,7 +65,7 @@ export async function runDatabaseDiagnostic(): Promise<void> {
     log("config", { ok: false, host, port, database, step: "TLS options", error: describeError(error, scrub) });
     return;
   }
-  log("config", { ok: true, host, port, database, tlsEnabled: ssl !== undefined, tlsCustomCa: Boolean(ssl?.ca), tlsRejectUnauthorized: ssl?.rejectUnauthorized ?? null });
+  log("config", { ok: true, host, port, database, tlsEnabled: ssl !== undefined, tlsCustomCa: Boolean(ssl?.ca), tlsCaSource: !ssl ? null : env.DATABASE_CA_CERT?.trim() ? "DATABASE_CA_CERT" : env.DATABASE_CA_CERT_PATH ? "DATABASE_CA_CERT_PATH" : "none",tlsRejectUnauthorized: ssl?.rejectUnauthorized ?? null });
 
   const tcp = await tcpProbe(host, port);
   if (!tcp.ok) {
