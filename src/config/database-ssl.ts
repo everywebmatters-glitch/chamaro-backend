@@ -10,12 +10,17 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
  */
 export function getDatabaseSslOptions(
   hostname: string,
-): { rejectUnauthorized: true; ca?: Buffer } | undefined {
+): { rejectUnauthorized: true; ca?: Buffer; servername?: string } | undefined {
   if (LOOPBACK_HOSTS.has(hostname)) {
     return undefined;
   }
   const ca = getDatabaseCa();
-  return ca ? { rejectUnauthorized: true, ca } : { rejectUnauthorized: true };
+  // The MariaDB driver upgrades its existing socket with tls.connect() without passing the host,
+  // so Node verifies the certificate against "localhost" unless a servername is given. Cloud SQL
+  // server certificates name the instance's DNS name (*.sql.goog), not its IP, so connections by
+  // IP set DATABASE_TLS_SERVERNAME to that name. The TCP destination stays the DATABASE_URL host.
+  const servername = env.DATABASE_TLS_SERVERNAME?.trim();
+  return { rejectUnauthorized: true, ...(ca ? { ca } : {}), ...(servername ? { servername } : {}) };
 }
 
 /**

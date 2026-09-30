@@ -40,6 +40,9 @@ export const env = {
   DATABASE_CA_CERT_PATH: process.env.DATABASE_CA_CERT_PATH,
   // PEM contents of the database server CA, for hosts where no certificate file is deployed.
   DATABASE_CA_CERT: process.env.DATABASE_CA_CERT,
+  // Name the database server certificate is issued to, when it differs from the DATABASE_URL host
+  // (e.g. Cloud SQL by public IP: <id>.<region>.sql.goog). Used for TLS verification and SNI only.
+  DATABASE_TLS_SERVERNAME: process.env.DATABASE_TLS_SERVERNAME,
   AUTH_RATE_LIMIT_MAX: Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10),
   AUTH_RATE_LIMIT_WINDOW: process.env.AUTH_RATE_LIMIT_WINDOW ?? "1 minute",
   get GOOGLE_CLIENT_ID() { return required("GOOGLE_CLIENT_ID"); },

@@ -72,7 +72,7 @@ function describeConfiguredCa(ca: Buffer | undefined): Record<string, unknown> |
 // handshake, records the certificate and closes. Verification is not aborted here only so the
 // failing certificate can be read; the handshake is still checked against the configured CA and
 // reported as authorized/authorizationError. The application's connection is unaffected.
-function peerCertificateProbe(host: string, port: number, ca: Buffer | undefined): Promise<PeerCertificateResult> {
+function peerCertificateProbe(host: string, port: number, ca: Buffer | undefined, servername: string | undefined): Promise<PeerCertificateResult> {
   return new Promise((resolve) => {
     const socket = tcpConnect({ host, port });
     let settled = false;
@@ -82,6 +82,7 @@ function peerCertificateProbe(host: string, port: number, ca: Buffer | undefined
     const finish = (result: PeerCertificateResult) => { if (!settled) { settled = true; (secure ?? socket).destroy(); resolve(result); } };
     socket.setTimeout(TCP_TIMEOUT_MS * 2, () => finish({ ok: false, error: { code: "PROBE_TIMEOUT", message: "No TLS handshake result in time" } }));
     socket.once("error", (error) => finish({ ok: false, stage: "tcp", error: describeError(error, (text) => text) }));
+    socket.once("close", () => finish({ ok: false, stage: "greeting", error: { code: "CLOSED_BEFORE_TLS", message: "Server closed the connection before the TLS handshake finished" } }));
     let greeting = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
       greeting = Buffer.concat([greeting, chunk]);
@@ -108,12 +109,12 @@ function peerCertificateProbe(host: string, port: number, ca: Buffer | undefined
       sslRequest.writeUInt32LE(16 * 1024 * 1024, 8);
       sslRequest[12] = 45; // utf8mb4_general_ci
       socket.write(sslRequest);
-      const tlsSocket = tlsConnect({ socket, ca, rejectUnauthorized: false });
+      const tlsSocket = tlsConnect({ socket, ca, servername, rejectUnauthorized: false });
       secure = tlsSocket;
       tlsSocket.on("error", (error) => finish({ ok: false, stage: "tls", error: describeError(error, (text) => text) }));
       tlsSocket.once("secureConnect", () => {
         const cert = tlsSocket.getPeerCertificate();
-        const identityError = cert && Object.keys(cert).length > 0 ? tlsCheckServerIdentity(host, cert) : undefined;
+        const identityError = cert && Object.keys(cert).length > 0 ? tlsCheckServerIdentity(servername ?? host, cert) : undefined;
         finish({
           ok: true,
           authorized: tlsSocket.authorized,
@@ -123,7 +124,8 @@ function peerCertificateProbe(host: string, port: number, ca: Buffer | undefined
           valid_from: cert?.valid_from ?? null,
           valid_to: cert?.valid_to ?? null,
           fingerprint256: cert?.fingerprint256 ?? null,
-          // Hostname/IP check the MariaDB driver runs after the CA check passes.
+          // Name check against the servername (as the driver does once one is set), else the host.
+          identityCheckedName: servername ?? host,
           identityCheck: identityError ? identityError.message : "passes",
         });
       });
@@ -156,7 +158,7 @@ export async function runDatabaseDiagnostic(): Promise<void> {
     log("config", { ok: false, host, port, database, step: "TLS options", error: describeError(error, scrub) });
     return;
   }
-  log("config", { ok: true, host, port, database, tlsEnabled: ssl !== undefined, tlsCustomCa: Boolean(ssl?.ca), tlsCaSource: !ssl ? null : env.DATABASE_CA_CERT?.trim() ? "DATABASE_CA_CERT" : env.DATABASE_CA_CERT_PATH ? "DATABASE_CA_CERT_PATH" : "none",tlsRejectUnauthorized: ssl?.rejectUnauthorized ?? null });
+  log("config", { ok: true, host, port, database, tlsEnabled: ssl !== undefined, tlsCustomCa: Boolean(ssl?.ca), tlsCaSource: !ssl ? null : env.DATABASE_CA_CERT?.trim() ? "DATABASE_CA_CERT" : env.DATABASE_CA_CERT_PATH ? "DATABASE_CA_CERT_PATH" : "none", tlsServername: ssl?.servername ?? null, tlsRejectUnauthorized: ssl?.rejectUnauthorized ?? null });
 
   const tcp = await tcpProbe(host, port);
   if (!tcp.ok) {
@@ -167,16 +169,32 @@ export async function runDatabaseDiagnostic(): Promise<void> {
 
   if (ssl) {
     try {
-      log("tlsPeerCertificate", { configuredCa: describeConfiguredCa(ssl.ca), ...(await peerCertificateProbe(host, port, ssl.ca)) });
+      log("tlsPeerCertificate", { configuredCa: describeConfiguredCa(ssl.ca), ...(await peerCertificateProbe(host, port, ssl.ca, ssl.servername)) });
     } catch (error) {
       log("tlsPeerCertificate", { ok: false, error: describeError(error, scrub) });
     }
   }
 
   // MariaDB driver directly: authentication, TLS and unknown-database errors keep their own codes here.
+  const driverOptions = { host, port, user, password, database, ssl, connectTimeout: 10_000 };
+  // The exact options object handed to the driver, minus credentials. The driver upgrades to TLS
+  // with tls.connect({ ...ssl, socket }), so ssl.servername is the only host Node's certificate
+  // name check can see; without it Node checks against its default, "localhost".
+  const tlsOptions = driverOptions.ssl;
+  log("mariadbConnectionOptions", {
+    host: driverOptions.host,
+    port: driverOptions.port,
+    database: driverOptions.database,
+    socketPath: (driverOptions as { socketPath?: string }).socketPath ?? null,
+    tlsEnabled: tlsOptions !== undefined,
+    tlsCustomCa: Boolean(tlsOptions?.ca),
+    tlsServername: tlsOptions?.servername ?? null,
+    tlsOptionKeys: tlsOptions ? Object.keys(tlsOptions) : [],
+    tlsNameCheckedByNode: tlsOptions?.servername ?? "localhost (Node default: driver passes no host/servername to tls.connect)",
+  });
   const driverStarted = Date.now();
   try {
-    const connection = await mariadb.createConnection({ host, port, user, password, database, ssl, connectTimeout: 10_000 });
+    const connection = await mariadb.createConnection(driverOptions);
     try {
       await connection.query("SELECT 1");
       log("mariadb", { ok: true, ms: Date.now() - driverStarted });
