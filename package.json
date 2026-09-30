@@ -7,6 +7,7 @@
     "dev": "tsx watch src/server.ts",
     "staging": "cross-env APP_ENV=staging tsx src/server.ts",
     "build": "prisma generate && tsc",
+    "postinstall": "npm run build",
     "test": "tsx --test tests/integration/**/*.test.ts",
     "test:security": "tsx --test tests/security/*.test.ts",
     "admin:create": "tsx src/scripts/create-admin.ts",
