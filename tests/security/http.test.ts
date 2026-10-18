@@ -1,12 +1,15 @@
 // Security regression tests through Fastify's in-process inject (no server, no database writes).
 // Requests that fail validation or auth never reach Prisma; one test reads a user by id (read-only).
 import "dotenv/config";
+import { isolatedDatabaseSkipReason } from "../helpers/throwaway-db.js";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { createSigner } from "fast-jwt";
 import { buildApp } from "../../src/app.js";
 import { redactUrl } from "../../src/config/logger.js";
 
+// Only the L2 test reads from the database (a user lookup), so only it needs the isolated test database.
+const skipReason = await isolatedDatabaseSkipReason();
 const app = await buildApp();
 after(() => app.close());
 
@@ -26,7 +29,7 @@ test("M1: registration is limited to 5 requests per hour per IP", async () => {
   assert.equal(other.statusCode, 400, "a different visitor has their own limit");
 });
 
-test("L2: only HS256 access tokens are accepted", async () => {
+test("L2: only HS256 access tokens are accepted", { skip: skipReason }, async () => {
   const secret = process.env.JWT_SECRET!;
   const claims = { sub: "no-such-user", role: "ADMIN" };
   const hs256 = createSigner({ key: secret, algorithm: "HS256" })(claims);

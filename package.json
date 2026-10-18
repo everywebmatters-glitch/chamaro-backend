@@ -10,6 +10,7 @@
     "postinstall": "npm run build",
     "test": "tsx --test tests/integration/**/*.test.ts",
     "test:security": "tsx --test tests/security/*.test.ts",
+    "test:unit": "tsx --test tests/unit/*.test.ts",
     "admin:create": "tsx src/scripts/create-admin.ts",
     "admin:promote": "tsx src/scripts/promote-admin.ts",
     "admin:delete": "tsx src/scripts/delete-admin.ts",

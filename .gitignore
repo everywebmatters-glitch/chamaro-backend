@@ -5,6 +5,18 @@ dist/
 generated/
 client_secret_*.json
 certs/
-# Integration tests write to whatever database DATABASE_URL points at: kept local.
-# tests/security/ (no database writes) is committed.
-tests/integration/
+# tests/ is committed, including tests/integration/. Integration tests write to whatever database
+# DATABASE_URL points at: run them only against a throwaway local database (see the guard in
+# tests/integration/product-stock.test.ts). Keep secrets, logs and artifacts out of tests/:
+tests/**/.env
+tests/**/.env.*
+tests/**/*.log
+tests/**/*.tmp
+tests/**/*.sql
+tests/**/*.sqlite
+tests/**/*.pem
+tests/**/*.key
+tests/**/*.tgz
+tests/**/coverage/
+tests/**/artifacts/
+tests/**/tmp/
