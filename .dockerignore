@@ -1,0 +1,17 @@
+node_modules
+dist
+generated
+.env
+.env.*
+!.env.example
+client_secret_*.json
+certs
+tests
+.git
+cd
+cls
+findstr
+gcloud
+npm
+powershell
+type
