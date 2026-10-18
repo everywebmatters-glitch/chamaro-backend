@@ -18,3 +18,4 @@ export function routeSchema(tags: string[], summary: string, extras: FastifySche
 }
 export function pageMeta(page: number, limit: number, total: number) { return { page, limit, total, totalPages: Math.ceil(total / limit) }; }
 export function notFound(message: string): Error { return Object.assign(new Error(message), { statusCode: 404, code: "NOT_FOUND" }); }
+export function httpError(statusCode: number, code: string, message: string): Error { return Object.assign(new Error(message), { statusCode, code }); }

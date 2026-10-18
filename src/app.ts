@@ -18,6 +18,8 @@ import { productRoutes } from "./routes/product.routes.js";
 import { categoryRoutes } from "./routes/category.routes.js";
 import { cmsRoutes } from "./routes/cms.routes.js";
 import { mediaRoutes } from "./routes/media.routes.js";
+import { addressRoutes } from "./routes/address.routes.js";
+import { orderRoutes } from "./routes/order.routes.js";
 
 export async function buildApp() {
   // Fastify's AJV defaults to removeAdditional: true, which silently strips properties that
@@ -50,5 +52,7 @@ export async function buildApp() {
   await app.register(categoryRoutes);
   await app.register(cmsRoutes);
   await app.register(mediaRoutes);
+  await app.register(addressRoutes);
+  await app.register(orderRoutes);
   return app;
 }

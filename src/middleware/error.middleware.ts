@@ -20,6 +20,8 @@ export function registerErrorHandler(app: FastifyInstance): void {
     if (code === "P2002") { statusCode = 409; code = "DUPLICATE_RECORD"; message = "A record with that value already exists"; }
     // Foreign-key RESTRICT, e.g. deleting a product that appears on a retail order or quotation.
     if (code === "P2003") { statusCode = 409; code = "RECORD_IN_USE"; message = "This record is referenced by other records and cannot be deleted"; }
+    // Two overlapping transactions collided (e.g. a deadlock) and retries were exhausted.
+    if (code === "P2034") { statusCode = 409; code = "CONFLICT_RETRY"; message = "The request conflicted with another one; please try again"; }
     if (code === "P2025") { statusCode = 404; code = "NOT_FOUND"; message = "Requested record was not found"; }
     if (error.validation) { statusCode = 400; code = "VALIDATION_ERROR"; message = "Request validation failed"; }
     reply.status(statusCode).send({ success: false, error: { code, message } });
