@@ -127,5 +127,16 @@ export function createAuthController(service: AuthService) {
       await service.resetPasswordWithOtp(email, otp, newPassword);
       return { success: true, data: { message: "Password has been reset successfully." } };
     },
+
+    async forgotPasswordRequestLink(request: FastifyRequest) {
+      await service.requestPasswordResetLink((request.body as { email: string }).email);
+      return { success: true, data: { message: "If an account exists for this email, a password reset link has been sent." } };
+    },
+
+    async resetPasswordWithToken(request: FastifyRequest) {
+      const { token, newPassword } = request.body as { token: string; newPassword: string };
+      await service.resetPasswordWithToken(token, newPassword);
+      return { success: true, data: { message: "Password has been reset successfully." } };
+    },
   };
 }

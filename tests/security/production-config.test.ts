@@ -50,3 +50,24 @@ test("production: Swagger (/docs, /docs/json) is not served; the API still is", 
   assert.equal(res.ok, true, res.err);
   assert.deepEqual(JSON.parse(res.out), { docs: 404, json: 404, health: 200 });
 });
+
+// APP_BASE_URL is read when an email link is built, not at startup, so these read it directly.
+function appBaseUrl(value: string | undefined) {
+  const script = `const { env } = await import("./src/config/env.ts"); console.log("APP_BASE_URL=" + env.APP_BASE_URL);`;
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: process.cwd(),
+    env: { ...process.env, APP_ENV: "production", CORS_ORIGIN: "https://chamaro.com", APP_BASE_URL: value ?? "" },
+    encoding: "utf8",
+  });
+  return { ok: result.status === 0, url: result.stdout.match(/APP_BASE_URL=(\S+)/)?.[1], err: result.stderr };
+}
+
+test("production: email links default to the storefront and must be public https", () => {
+  assert.equal(appBaseUrl(undefined).url, "https://chamaro.com");
+  assert.equal(appBaseUrl("https://chamaro.com/").url, "https://chamaro.com", "a trailing slash is dropped");
+  for (const bad of ["http://chamaro.com", "https://localhost:3000", "not a url"]) {
+    const res = appBaseUrl(bad);
+    assert.equal(res.ok, false, bad);
+    assert.match(res.err, /APP_BASE_URL/);
+  }
+});

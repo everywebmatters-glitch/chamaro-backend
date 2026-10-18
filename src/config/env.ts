@@ -30,6 +30,20 @@ function productionCorsOrigin(): string {
   return value;
 }
 
+// Customer-facing site that email links (e.g. password reset) point at. Production must be a public https URL;
+// it defaults to the storefront, never the admin app.
+function appBaseUrl(): string {
+  const value = (process.env.APP_BASE_URL?.trim() || (isProduction ? "https://chamaro.com" : "http://localhost:3000")).replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("APP_BASE_URL is not a valid URL");
+  }
+  if (isProduction && (url.protocol !== "https:" || LOCAL_HOSTNAMES.has(url.hostname))) throw new Error("APP_BASE_URL must be a public https URL when APP_ENV=production");
+  return value;
+}
+
 export const env = {
   PORT: Number(process.env.PORT ?? 4000),
   HOST: process.env.HOST ?? "0.0.0.0",
@@ -54,6 +68,9 @@ export const env = {
   OTP_RESEND_COOLDOWN_SECONDS: Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 60),
   // How long a completed checkout/payment OTP verification authorizes a payment attempt for.
   CHECKOUT_VERIFICATION_TTL_MINUTES: Number(process.env.CHECKOUT_VERIFICATION_TTL_MINUTES ?? 15),
+  get APP_BASE_URL() { return appBaseUrl(); },
+  // How long a password-reset link works for. Each link also works only once.
+  PASSWORD_RESET_TOKEN_TTL_MINUTES: Number(process.env.PASSWORD_RESET_TOKEN_TTL_MINUTES ?? 30),
   get GOOGLE_CLIENT_ID() { return required("GOOGLE_CLIENT_ID"); },
   get GOOGLE_CLIENT_SECRET() { return required("GOOGLE_CLIENT_SECRET"); },
   // Backend callback registered with Google, e.g. http://localhost:4000/api/v1/auth/google/callback

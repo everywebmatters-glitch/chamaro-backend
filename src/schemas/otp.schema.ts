@@ -71,3 +71,22 @@ export const forgotPasswordResetRouteSchema = routeSchema(["Authentication"], "R
   body: forgotPasswordResetBody,
   response: { 200: genericMessageResponseSchema },
 });
+
+// ---- password reset by emailed link (alongside the code flow above) ----------------------------------------------
+
+export const resetTokenPattern = "^[A-Za-z0-9_-]{43}$";
+
+export const forgotPasswordRequestLinkRouteSchema = routeSchema(["Authentication"], "Email a single-use password-reset link (customer accounts)", {
+  body: sendOtpBody,
+  response: { 200: genericMessageResponseSchema },
+});
+
+export const resetPasswordWithTokenRouteSchema = routeSchema(["Authentication"], "Set a new password using the token from a password-reset link", {
+  body: {
+    type: "object",
+    additionalProperties: false,
+    required: ["token", "newPassword"],
+    properties: { token: { type: "string", pattern: resetTokenPattern }, newPassword: newPasswordProperty },
+  },
+  response: { 200: genericMessageResponseSchema },
+});

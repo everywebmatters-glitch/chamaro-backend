@@ -48,10 +48,21 @@ const idempotencyHeaders = {
   properties: { "idempotency-key": { type: "string", minLength: 8, maxLength: 64, pattern: "^[A-Za-z0-9_:.-]+$" } },
 };
 
+// Entered by hand from the courier's receipt; no shipping-provider API is involved.
+const shipOrderBody = {
+  type: "object",
+  additionalProperties: false,
+  required: ["carrier", "trackingNumber"],
+  properties: {
+    carrier: { type: "string", minLength: 1, maxLength: 64, pattern: "\\S" },
+    trackingNumber: { type: "string", minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9 _./-]*$" },
+  },
+};
+
 const bearer = [{ bearerAuth: [] }];
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
-  const service = createOrderService(app.prisma);
+  const service = createOrderService(app.prisma, { log: app.log });
   const userId = (request: FastifyRequest) => (request.user as { sub: string }).sub;
 
   // ---- customer cart -----------------------------------------------------------------------------------------
@@ -115,4 +126,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     await request.requireAdmin();
     return { success: true, data: await service.adminGetOrder((request.params as { id: string }).id) };
   });
+
+  app.post(
+    "/api/v1/admin/orders/:id/ship",
+    { schema: routeSchema(["Admin", "Orders"], "Mark an order as shipped with its carrier and tracking number, and email the customer", { security: bearer, params: idParams, body: shipOrderBody }) },
+    async (request) => {
+      await request.requireAdmin();
+      const body = request.body as { carrier: string; trackingNumber: string };
+      return { success: true, data: await service.adminShipOrder((request.params as { id: string }).id, { carrier: body.carrier.trim(), trackingNumber: body.trackingNumber.trim() }) };
+    },
+  );
 };

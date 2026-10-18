@@ -34,10 +34,26 @@ model User {
   adminProfile         AdminUser?
   customer             Customer?
   checkoutVerification CheckoutVerification?
+  passwordResetTokens  PasswordResetToken[]
   createdAt            DateTime              @default(now())
   updatedAt            DateTime              @updatedAt
 
   @@index([role, isActive])
+}
+
+// Single-use password-reset links. Only the SHA-256 of the random token is stored (the token itself
+// is in the emailed link and nowhere else). usedAt is set exactly once, by a conditional update, when
+// the link resets a password or is superseded, so a token can never be redeemed twice.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique @db.Char(64)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
 }
 
 enum OtpPurpose {
@@ -362,6 +378,10 @@ model RetailOrder {
   note                    String?             @db.Text
   // Client-chosen key (Idempotency-Key header): a retried request returns the order it already created.
   idempotencyKey          String?             @db.VarChar(64)
+  // Set together when an admin marks the order SHIPPED. Entered by hand; no shipping-provider integration yet.
+  carrier                 String?             @db.VarChar(64)
+  trackingNumber          String?             @db.VarChar(128)
+  shippedAt               DateTime?
   shippingAddressId       String?
   // Order history must survive: customers/addresses referenced by an order cannot be deleted.
   customer                Customer            @relation(fields: [customerId], references: [id], onDelete: Restrict)

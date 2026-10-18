@@ -1,5 +1,6 @@
 # Cloud Run service for the Chamaro API. Replace every <PLACEHOLDER>, then:
 #   gcloud run services replace deploy/cloudrun/service.yaml --region asia-south1
+# GOOGLE_* and RESEND_* values come from Secret Manager (not literals) so a `services replace` can never revert them.
 # The Cloud SQL Auth Proxy runs beside the API and listens on 127.0.0.1:3306, so DATABASE_URL
 # points at 127.0.0.1 and config/database-ssl.ts skips client TLS (the proxy encrypts to Cloud SQL).
 apiVersion: serving.knative.dev/v1
@@ -31,11 +32,20 @@ spec:
             - name: CORS_ORIGIN
               value: https://chamaro-admin-477932129337.asia-south1.run.app,https://chamaro-webapp-477932129337.asia-south1.run.app
             - name: GOOGLE_CLIENT_ID
-              value: <GOOGLE_CLIENT_ID>
+              valueFrom:
+                secretKeyRef:
+                  name: GOOGLE_CLIENT_ID
+                  key: latest
             - name: GOOGLE_REDIRECT_URI
-              value: https://chamaro-api-477932129337.asia-south1.run.app/api/v1/auth/google/callback
+              valueFrom:
+                secretKeyRef:
+                  name: GOOGLE_REDIRECT_URI
+                  key: latest
             - name: GOOGLE_FRONTEND_CALLBACK_URL
-              value: https://chamaro-webapp-477932129337.asia-south1.run.app/account/google/callback/
+              valueFrom:
+                secretKeyRef:
+                  name: GOOGLE_FRONTEND_CALLBACK_URL
+                  key: latest
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -49,8 +59,22 @@ spec:
             - name: GOOGLE_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: chamaro-google-client-secret
+                  name: GOOGLE_CLIENT_SECRET
                   key: latest
+            # Read only when an email is sent (the Resend client is created lazily), but every email needs both.
+            - name: RESEND_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: RESEND_API_KEY
+                  key: latest
+            - name: RESEND_FROM_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: RESEND_FROM_EMAIL
+                  key: latest
+            # Customer storefront for email links (password reset). Never the admin domain.
+            - name: APP_BASE_URL
+              value: https://chamaro.com
           resources:
             limits:
               cpu: "1"

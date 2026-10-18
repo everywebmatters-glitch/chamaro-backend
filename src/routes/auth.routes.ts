@@ -11,9 +11,11 @@ import {
   registerRouteSchema,
 } from "../schemas/auth.schema.js";
 import {
+  forgotPasswordRequestLinkRouteSchema,
   forgotPasswordResetRouteSchema,
   forgotPasswordSendOtpRouteSchema,
   forgotPasswordVerifyOtpRouteSchema,
+  resetPasswordWithTokenRouteSchema,
   sendLoginOtpRouteSchema,
   verifyLoginOtpRouteSchema,
 } from "../schemas/otp.schema.js";
@@ -29,7 +31,7 @@ const registerRateLimit = { config: { rateLimit: { max: 5, timeWindow: "1 hour" 
 const otpRateLimit = { config: { rateLimit: { max: env.OTP_RATE_LIMIT_MAX, timeWindow: env.OTP_RATE_LIMIT_WINDOW } } };
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
-  const controller = createAuthController(createAuthService(app.prisma));
+  const controller = createAuthController(createAuthService(app.prisma, { log: app.log }));
 
   app.get("/api/v1/auth/google", { schema: googleAuthorizeRouteSchema }, (request, reply) => controller.googleAuthorize(request, reply));
   app.get("/api/v1/auth/google/callback", { schema: googleCallbackRouteSchema }, (request, reply) => controller.googleCallback(request, reply));
@@ -48,4 +50,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   app.post("/api/v1/auth/forgot-password/send-otp", { ...otpRateLimit, schema: forgotPasswordSendOtpRouteSchema }, (request) => controller.forgotPasswordSendOtp(request));
   app.post("/api/v1/auth/forgot-password/verify-otp", { ...otpRateLimit, schema: forgotPasswordVerifyOtpRouteSchema }, (request) => controller.forgotPasswordVerifyOtp(request));
   app.post("/api/v1/auth/forgot-password/reset", { ...otpRateLimit, schema: forgotPasswordResetRouteSchema }, (request) => controller.forgotPasswordReset(request));
+
+  // Link-based reset, alongside the code flow above. Same rate limit: each request can cost an email.
+  app.post("/api/v1/auth/forgot-password/request-link", { ...otpRateLimit, schema: forgotPasswordRequestLinkRouteSchema }, (request) => controller.forgotPasswordRequestLink(request));
+  app.post("/api/v1/auth/reset-password", { ...otpRateLimit, schema: resetPasswordWithTokenRouteSchema }, (request) => controller.resetPasswordWithToken(request));
 };

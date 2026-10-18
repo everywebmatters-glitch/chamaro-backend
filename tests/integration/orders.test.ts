@@ -1,5 +1,6 @@
 // Cart, addresses and orders: authorization, validation, server-side pricing, stock reservation and races,
-// duplicate protection and rollback. Runs only against the isolated local test database.
+// duplicate protection and rollback, and the order/shipment emails. Runs only against the isolated local test
+// database. Every email goes to a fake Resend client, never the real one.
 import "dotenv/config";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -9,7 +10,15 @@ import { isolatedDatabaseSkipReason } from "../helpers/throwaway-db.js";
 const skipReason = await isolatedDatabaseSkipReason();
 type App = Awaited<ReturnType<typeof import("../../src/app.js")["buildApp"]>>;
 
+// Emails "sent" by the current test; set failEmails to make the fake provider return an error.
+const outbox: { to: string; subject: string; html: string }[] = [];
+let failEmails = false;
+const { setEmailClientForTests } = await import("../../src/services/email.service.js");
+setEmailClientForTests({ emails: { send: async (message) => { outbox.push(message); return { error: failEmails ? { message: "provider down" } : null }; } } });
+
 async function withShop(run: (shop: Shop) => Promise<void>) {
+  outbox.length = 0;
+  failEmails = false;
   const { buildApp } = await import("../../src/app.js");
   const app = await buildApp();
   const shop = new Shop(app);
@@ -121,6 +130,7 @@ test("cart, addresses and orders require a customer; admin order routes require 
       ["POST", "/api/v1/orders/x/cancel", undefined],
       ["GET", "/api/v1/admin/orders", undefined],
       ["GET", "/api/v1/admin/orders/x", undefined],
+      ["POST", "/api/v1/admin/orders/x/ship", { carrier: "Blue Dart", trackingNumber: "BD123" }],
     ];
     for (const [method, url, payload] of routes) {
       const anonymous = await app.inject({ method: method as "GET", url, headers: { "idempotency-key": "anonymous-key-1" }, payload });
@@ -387,6 +397,111 @@ test("one cart cannot become two orders, even with different keys at the same mo
     assert.deepEqual(results.map((result) => result.statusCode).sort(), [201, 400, 400], results.map((result) => result.body).join(" | "));
     assert.equal(await app.prisma.retailOrder.count({ where: { customerId: buyer.customerId } }), 1);
     assert.equal(await shop.reserved(product.id), 3);
+  }));
+
+// ---- order and shipment emails -------------------------------------------------------------------------------------
+
+test("a placed order sends one confirmation; retries and double submits with the same key send no more", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const product = await shop.product({ price: "1500.00", stock: 10 });
+    const buyer = await readyCustomer(shop, product.id, 2);
+    const body = { addressId: buyer.address, shippingMethod: "express" };
+
+    const first = await shop.order(buyer.headers, body, "email-key-0001");
+    assert.equal(first.statusCode, 201, first.body);
+    const order = first.json().data;
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0].to, buyer.user.email);
+    assert.equal(outbox[0].subject, `Your Chamaro order ${order.id}`);
+    for (const part of [order.id, product.name, "&times; 2", order.subtotal, order.shippingTotal, order.total, "12 MG Road"]) assert.ok(outbox[0].html.includes(part), part);
+
+    assert.equal((await shop.order(buyer.headers, body, "email-key-0001")).statusCode, 200);
+    assert.equal(outbox.length, 1, "a retry sends nothing");
+
+    const other = await readyCustomer(shop, product.id, 1, "double");
+    const burst = await Promise.all([1, 2, 3, 4].map(() => shop.order(other.headers, { addressId: other.address, shippingMethod: "standard" }, "email-burst-0001")));
+    assert.deepEqual(burst.map((result) => result.statusCode).sort(), [200, 200, 200, 201]);
+    assert.equal(outbox.filter((message) => message.to === other.user.email).length, 1, "simultaneous submits send one email");
+  }));
+
+test("a failed confirmation email never undoes the order; a rejected order sends nothing", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const product = await shop.product({ stock: 1 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    failEmails = true;
+    const placed = await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" });
+    assert.equal(placed.statusCode, 201, placed.body);
+    assert.equal(outbox.length, 1, "the send was attempted");
+    assert.equal(await app.prisma.retailOrder.count({ where: { customerId: buyer.customerId } }), 1);
+    assert.equal(await shop.reserved(product.id), 1);
+
+    failEmails = false;
+    const late = await readyCustomer(shop, product.id, 1, "late");
+    const rejected = await shop.order(late.headers, { addressId: late.address, shippingMethod: "standard" });
+    assert.equal(rejected.statusCode, 409);
+    assert.equal(outbox.length, 1, "no email for an order that was not placed");
+  }));
+
+test("admin ship: records carrier and tracking, emails once, is idempotent, and refuses final states", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const admin = await shop.admin();
+    const product = await shop.product({ stock: 10 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    outbox.length = 0;
+    const ship = (payload: object, id = orderId) => app.inject({ method: "POST", url: `/api/v1/admin/orders/${id}/ship`, headers: admin.headers, payload });
+
+    const shipped = await ship({ carrier: " Blue Dart ", trackingNumber: "BD-77001 " });
+    assert.equal(shipped.statusCode, 200, shipped.body);
+    const data = shipped.json().data;
+    assert.equal(data.status, "SHIPPED");
+    assert.equal(data.carrier, "Blue Dart");
+    assert.equal(data.trackingNumber, "BD-77001");
+    assert.ok(data.shippedAt);
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0].to, buyer.user.email);
+    assert.ok(outbox[0].html.includes("BD-77001") && outbox[0].html.includes("Blue Dart"));
+
+    const again = await ship({ carrier: "Blue Dart", trackingNumber: "BD-77001" });
+    assert.equal(again.statusCode, 200);
+    assert.equal(again.json().data.shippedAt, data.shippedAt);
+    assert.equal(outbox.length, 1, "repeating the same request sends no second email");
+
+    const different = await ship({ carrier: "Delhivery", trackingNumber: "DL-1" });
+    assert.equal(different.statusCode, 409);
+    assert.equal(different.json().error.code, "ORDER_ALREADY_SHIPPED");
+
+    // The customer sees the tracking details on their own order too.
+    const mine = await app.inject({ method: "GET", url: `/api/v1/orders/${orderId}`, headers: buyer.headers });
+    assert.equal(mine.json().data.trackingNumber, "BD-77001");
+
+    const cancelled = await readyCustomer(shop, product.id, 1, "cancelled");
+    const cancelledId = (await shop.order(cancelled.headers, { addressId: cancelled.address, shippingMethod: "standard" })).json().data.id as string;
+    await app.inject({ method: "POST", url: `/api/v1/orders/${cancelledId}/cancel`, headers: cancelled.headers });
+    const refused = await ship({ carrier: "Blue Dart", trackingNumber: "BD-2" }, cancelledId);
+    assert.equal(refused.statusCode, 409);
+    assert.equal(refused.json().error.code, "ORDER_NOT_SHIPPABLE");
+
+    assert.equal((await ship({ carrier: "Blue Dart", trackingNumber: "BD-3" }, "no-such-order")).statusCode, 404);
+    assert.equal((await ship({ carrier: "Blue Dart" })).statusCode, 400);
+    assert.equal((await ship({ carrier: "Blue Dart", trackingNumber: "<script>" })).statusCode, 400);
+  }));
+
+test("admin ship: a failed shipment email still leaves the order shipped", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const admin = await shop.admin();
+    const product = await shop.product({ stock: 5 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    failEmails = true;
+    const shipped = await app.inject({ method: "POST", url: `/api/v1/admin/orders/${orderId}/ship`, headers: admin.headers, payload: { carrier: "India Post", trackingNumber: "EE123456789IN" } });
+    assert.equal(shipped.statusCode, 200, shipped.body);
+    const stored = await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId } });
+    assert.equal(stored.status, "SHIPPED");
+    assert.equal(stored.trackingNumber, "EE123456789IN");
   }));
 
 // ---- cancelling ----------------------------------------------------------------------------------------------------

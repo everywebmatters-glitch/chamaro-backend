@@ -1,7 +1,12 @@
+import { createHash, randomBytes } from "node:crypto";
+import type { FastifyBaseLogger } from "fastify";
 import type { PrismaClient } from "../../generated/prisma/client.js";
+import { env } from "../config/env.js";
 import { hashPassword, verifyPasswordConstantWork } from "../utils/password.js";
 import { createAuthRepository } from "../repositories/auth.repository.js";
+import { createPasswordResetRepository } from "../repositories/password-reset.repository.js";
 import { createOtpService } from "./otp.service.js";
+import { sendPasswordResetLinkEmail } from "./email.service.js";
 import { googleProvider } from "../providers/google.provider.js";
 import type { AdminLoginInput, GoogleIdentity, LoginInput, RegisterInput, SafeUser } from "../types/auth.types.js";
 
@@ -15,8 +20,24 @@ function googleAccountNotLinked(): Error {
   return Object.assign(new Error("An account already exists for this email; sign in with its existing method to link Google"), { statusCode: 409, code: "GOOGLE_ACCOUNT_NOT_LINKED" });
 }
 
-export function createAuthService(prisma: PrismaClient) {
+function resetTokenInvalid(): Error {
+  return Object.assign(new Error("This reset link is invalid or has expired; request a new one"), { statusCode: 400, code: "RESET_TOKEN_INVALID" });
+}
+
+// Reset tokens are 256 random bits, so a fast unsalted SHA-256 is enough to make the stored value useless
+// to anyone who reads the table; it also lets the token be looked up by its hash.
+export function hashResetToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+// The token goes in the fragment, so it is never sent to the storefront's server or leaked via Referer.
+export function passwordResetUrl(token: string): string {
+  return `${env.APP_BASE_URL}/reset-password#token=${token}`;
+}
+
+export function createAuthService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
   const repository = createAuthRepository(prisma);
+  const resetTokens = createPasswordResetRepository(prisma);
   const otpService = createOtpService(prisma);
 
   async function loginWithGoogle(identity: GoogleIdentity) {
@@ -136,6 +157,32 @@ export function createAuthService(prisma: PrismaClient) {
       if (!user || !user.isActive) throw accountInactive();
       const passwordHash = await hashPassword(newPassword);
       await repository.updatePassword(user.id, passwordHash);
+      await resetTokens.invalidateForUser(user.id);
+    },
+
+    // Emails a single-use reset link to an active CUSTOMER account (admins keep the code flow, and their reset
+    // must not point at the storefront). Every other case, a send within the resend cooldown, and a failed email
+    // all return the same way, so the caller can't tell whether the email has an account.
+    async requestPasswordResetLink(email: string): Promise<void> {
+      const normalized = email.trim().toLowerCase();
+      const user = await repository.findByEmail(normalized);
+      if (!user || !user.isActive || user.role !== "CUSTOMER") return;
+      const latest = await resetTokens.findLatestForUser(user.id);
+      if (latest && Date.now() - latest.createdAt.getTime() < env.OTP_RESEND_COOLDOWN_SECONDS * 1000) return;
+
+      const token = randomBytes(32).toString("base64url");
+      const expiresAt = new Date(Date.now() + env.PASSWORD_RESET_TOKEN_TTL_MINUTES * 60_000);
+      await resetTokens.issue({ userId: user.id, tokenHash: hashResetToken(token), expiresAt });
+      try {
+        await sendPasswordResetLinkEmail(user.email, passwordResetUrl(token), env.PASSWORD_RESET_TOKEN_TTL_MINUTES);
+      } catch (error) {
+        options.log?.error({ err: { code: (error as { code?: unknown }).code }, userId: user.id }, "Password reset email failed");
+      }
+    },
+
+    async resetPasswordWithToken(token: string, newPassword: string): Promise<void> {
+      const passwordHash = await hashPassword(newPassword);
+      if (!(await resetTokens.redeem(hashResetToken(token), passwordHash))) throw resetTokenInvalid();
     },
   };
 }
