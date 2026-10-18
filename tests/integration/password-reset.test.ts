@@ -153,6 +153,21 @@ test("two simultaneous resets with the same token: exactly one succeeds", { skip
     assert.deepEqual(results.map((res) => res.statusCode).sort(), [200, 400, 400]);
   }));
 
+test("a link issued to a customer who is later made an admin or deactivated cannot reset the password", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    for (const change of [{ role: "ADMIN" as const }, { isActive: false }]) {
+      const customer = await ctx.user();
+      await ctx.requestLink(customer.email);
+      const token = ctx.lastToken();
+      await ctx.app.prisma.user.update({ where: { id: customer.id }, data: change });
+      const refused = await ctx.reset(token);
+      assert.equal(refused.statusCode, 400, JSON.stringify(change));
+      assert.equal(refused.json().error.code, "RESET_TOKEN_INVALID");
+      const stored = await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: customer.id } });
+      assert.equal(stored.passwordHash, customer.passwordHash, `${JSON.stringify(change)}: password unchanged`);
+    }
+  }));
+
 test("a reset by code (OTP) still works and revokes any outstanding reset link", { skip: skipReason }, () =>
   withApp(async (ctx) => {
     const customer = await ctx.user();

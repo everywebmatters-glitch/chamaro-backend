@@ -44,6 +44,16 @@ function appBaseUrl(): string {
   return value;
 }
 
+// A whole number of minutes within [min, max]; unset means the default. Anything else stops startup, so a typo can
+// never produce a reset link that never expires (NaN) or one that has already expired (0 or negative).
+function minutesSetting(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be a whole number of minutes from ${min} to ${max}`);
+  return value;
+}
+
 export const env = {
   PORT: Number(process.env.PORT ?? 4000),
   HOST: process.env.HOST ?? "0.0.0.0",
@@ -70,7 +80,7 @@ export const env = {
   CHECKOUT_VERIFICATION_TTL_MINUTES: Number(process.env.CHECKOUT_VERIFICATION_TTL_MINUTES ?? 15),
   get APP_BASE_URL() { return appBaseUrl(); },
   // How long a password-reset link works for. Each link also works only once.
-  PASSWORD_RESET_TOKEN_TTL_MINUTES: Number(process.env.PASSWORD_RESET_TOKEN_TTL_MINUTES ?? 30),
+  PASSWORD_RESET_TOKEN_TTL_MINUTES: minutesSetting("PASSWORD_RESET_TOKEN_TTL_MINUTES", 30, 5, 120),
   get GOOGLE_CLIENT_ID() { return required("GOOGLE_CLIENT_ID"); },
   get GOOGLE_CLIENT_SECRET() { return required("GOOGLE_CLIENT_SECRET"); },
   // Backend callback registered with Google, e.g. http://localhost:4000/api/v1/auth/google/callback

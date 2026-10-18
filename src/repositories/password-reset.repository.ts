@@ -15,12 +15,13 @@ export function createPasswordResetRepository(prisma: PrismaClient) {
     // Redeems a token and sets the new password in one transaction. The conditional update is the single-use
     // guarantee: of two concurrent requests with the same token, InnoDB lets exactly one change the row
     // (usedAt NULL -> now); the other then matches nothing. Returns false for an unknown, expired, already-used
-    // or superseded token, and for an inactive account, without changing anything.
+    // or superseded token, and for an inactive or non-customer account, without changing anything.
     redeem: (tokenHash: string, passwordHash: string) =>
       prisma.$transaction(async (tx) => {
         const now = new Date();
-        const record = await tx.passwordResetToken.findUnique({ where: { tokenHash }, include: { user: { select: { id: true, email: true, isActive: true } } } });
-        if (!record || !record.user.isActive) return false;
+        const record = await tx.passwordResetToken.findUnique({ where: { tokenHash }, include: { user: { select: { id: true, email: true, isActive: true, role: true } } } });
+        // Links are only issued to customers; one issued before the account became an admin must not reset it.
+        if (!record || !record.user.isActive || record.user.role !== "CUSTOMER") return false;
         const claimed = await tx.passwordResetToken.updateMany({ where: { id: record.id, usedAt: null, expiresAt: { gt: now } }, data: { usedAt: now } });
         if (claimed.count !== 1) return false;
         await tx.user.update({ where: { id: record.userId }, data: { passwordHash } });

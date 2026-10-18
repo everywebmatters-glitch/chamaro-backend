@@ -44,6 +44,9 @@ type OrderRow = Prisma.RetailOrderGetPayload<{ include: typeof orderInclude }>;
 
 // Orders an admin may mark as shipped. COMPLETED and CANCELLED are final; SHIPPED is handled separately.
 const SHIPPABLE_STATUSES = new Set(["PENDING", "CONFIRMED", "PROCESSING"]);
+// Chamaro has no cash on delivery: an order ships only once its payment is PAID, which only a verified payment
+// provider confirmation may set. The fulfilment status (PENDING/CONFIRMED/PROCESSING) never implies payment.
+// No payment provider is integrated yet, so no order can be shipped until one is.
 
 export function presentOrder<T extends OrderRow>(order: T) {
   const { shippingAddressSnapshot, ...rest } = order;
@@ -158,7 +161,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         // Update, add and remove lines by id instead of deleting the whole cart and re-inserting it: deleting by cart
         // takes gap locks that make two customers saving their carts at the same moment deadlock.
         const current = await tx.cartItem.findMany({ where: { cartId: cart.id }, select: { id: true, productId: true, variantId: true, quantity: true } });
-        const keyOf = (line: { productId: string; variantId: string | null }) => `${line.productId} ${line.variantId ?? ""}`;
+        const keyOf = (line: { productId: string; variantId: string | null }) => `${line.productId}\u0000${line.variantId ?? ""}`;
         const wanted = new Map(merged.map((line) => [keyOf(line), line]));
         const kept = new Set<string>();
         for (const line of current) {
@@ -333,6 +336,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
           throw httpError(409, "ORDER_ALREADY_SHIPPED", "This order has already been marked as shipped");
         }
         if (!SHIPPABLE_STATUSES.has(order.status)) throw httpError(409, "ORDER_NOT_SHIPPABLE", `A ${order.status.toLowerCase()} order can't be marked as shipped`);
+        if (order.paymentStatus !== "PAID") throw httpError(409, "ORDER_NOT_PAID", "Only orders with a verified online payment can be shipped");
         const shipped = await tx.retailOrder.update({
           where: { id: orderId },
           data: { status: "SHIPPED", carrier: input.carrier, trackingNumber: input.trackingNumber, shippedAt: new Date() },

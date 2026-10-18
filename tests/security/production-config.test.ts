@@ -71,3 +71,23 @@ test("production: email links default to the storefront and must be public https
     assert.match(res.err, /APP_BASE_URL/);
   }
 });
+
+function resetTtl(value: string | undefined) {
+  const script = `const { env } = await import("./src/config/env.ts"); console.log("TTL=" + env.PASSWORD_RESET_TOKEN_TTL_MINUTES);`;
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: process.cwd(),
+    env: { ...process.env, APP_ENV: "production", CORS_ORIGIN: "https://chamaro.com", PASSWORD_RESET_TOKEN_TTL_MINUTES: value ?? "" },
+    encoding: "utf8",
+  });
+  return { ok: result.status === 0, ttl: result.stdout.match(/TTL=(\S+)/)?.[1], err: result.stderr };
+}
+
+test("production: reset links last 30 minutes by default; a missing, zero, negative or non-numeric TTL stops startup", () => {
+  assert.equal(resetTtl(undefined).ttl, "30");
+  assert.equal(resetTtl("15").ttl, "15");
+  for (const bad of ["0", "-5", "abc", "1.5", "4", "121"]) {
+    const res = resetTtl(bad);
+    assert.equal(res.ok, false, bad);
+    assert.match(res.err, /PASSWORD_RESET_TOKEN_TTL_MINUTES/);
+  }
+});

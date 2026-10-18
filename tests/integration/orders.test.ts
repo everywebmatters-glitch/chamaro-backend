@@ -108,6 +108,11 @@ async function readyCustomer(shop: Shop, productId: string, quantity = 1, label 
   return { ...customer, address };
 }
 
+// Stands in for a verified payment-provider confirmation, which the API has no way to record yet. Test database only.
+async function markPaid(app: App, orderId: string) {
+  await app.prisma.retailOrder.update({ where: { id: orderId }, data: { paymentStatus: "PAID" } });
+}
+
 // ---- authorization ------------------------------------------------------------------------------------------------
 
 test("cart, addresses and orders require a customer; admin order routes require an admin", { skip: skipReason }, () =>
@@ -450,6 +455,7 @@ test("admin ship: records carrier and tracking, emails once, is idempotent, and 
     const product = await shop.product({ stock: 10 });
     const buyer = await readyCustomer(shop, product.id, 1);
     const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    await markPaid(app, orderId);
     outbox.length = 0;
     const ship = (payload: object, id = orderId) => app.inject({ method: "POST", url: `/api/v1/admin/orders/${id}/ship`, headers: admin.headers, payload });
 
@@ -489,6 +495,61 @@ test("admin ship: records carrier and tracking, emails once, is idempotent, and 
     assert.equal((await ship({ carrier: "Blue Dart", trackingNumber: "<script>" })).statusCode, 400);
   }));
 
+test("admin ship: no cash on delivery -- unpaid and refunded orders are refused, whatever their fulfilment status", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const admin = await shop.admin();
+    const product = await shop.product({ stock: 10 });
+    const ship = (id: string) => app.inject({ method: "POST", url: `/api/v1/admin/orders/${id}/ship`, headers: admin.headers, payload: { carrier: "Blue Dart", trackingNumber: "BD-900" } });
+
+    for (const [label, data] of [
+      ["pending/unpaid", {}],
+      ["confirmed/unpaid", { status: "CONFIRMED" }],
+      ["processing/unpaid", { status: "PROCESSING" }],
+      ["processing/refunded", { status: "PROCESSING", paymentStatus: "REFUNDED" }],
+    ] as const) {
+      const buyer = await readyCustomer(shop, product.id, 1, label.replace("/", "-"));
+      const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+      await app.prisma.retailOrder.update({ where: { id: orderId }, data });
+      outbox.length = 0;
+      const refused = await ship(orderId);
+      assert.equal(refused.statusCode, 409, label);
+      assert.equal(refused.json().error.code, "ORDER_NOT_PAID", label);
+      assert.equal(outbox.length, 0, `${label}: no shipment email`);
+      const stored = await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId } });
+      assert.equal(stored.status, (data as { status?: string }).status ?? "PENDING", `${label}: status unchanged`);
+      assert.equal(stored.trackingNumber, null, `${label}: no tracking recorded`);
+    }
+  }));
+
+test("admin ship: concurrent duplicate requests ship once and email once", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const admin = await shop.admin();
+    const product = await shop.product({ stock: 5 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    await markPaid(app, orderId);
+    outbox.length = 0;
+    const burst = await Promise.all([1, 2, 3, 4].map(() => app.inject({ method: "POST", url: `/api/v1/admin/orders/${orderId}/ship`, headers: admin.headers, payload: { carrier: "Blue Dart", trackingNumber: "BD-500" } })));
+    assert.deepEqual(burst.map((response) => response.statusCode), [200, 200, 200, 200]);
+    assert.equal(new Set(burst.map((response) => response.json().data.shippedAt)).size, 1, "one shipment time");
+    assert.equal(outbox.length, 1, "exactly one shipment email");
+  }));
+
+test("admin ship: customer tokens and anonymous requests are refused", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const product = await shop.product({ stock: 5 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    await markPaid(app, orderId);
+    const payload = { carrier: "Blue Dart", trackingNumber: "BD-600" };
+    assert.equal((await app.inject({ method: "POST", url: `/api/v1/admin/orders/${orderId}/ship`, payload })).statusCode, 401);
+    assert.equal((await app.inject({ method: "POST", url: `/api/v1/admin/orders/${orderId}/ship`, headers: buyer.headers, payload })).statusCode, 403);
+    assert.equal((await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId } })).status, "PENDING");
+  }));
+
 test("admin ship: a failed shipment email still leaves the order shipped", { skip: skipReason }, () =>
   withShop(async (shop) => {
     const { app } = shop;
@@ -496,6 +557,7 @@ test("admin ship: a failed shipment email still leaves the order shipped", { ski
     const product = await shop.product({ stock: 5 });
     const buyer = await readyCustomer(shop, product.id, 1);
     const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    await markPaid(app, orderId);
     failEmails = true;
     const shipped = await app.inject({ method: "POST", url: `/api/v1/admin/orders/${orderId}/ship`, headers: admin.headers, payload: { carrier: "India Post", trackingNumber: "EE123456789IN" } });
     assert.equal(shipped.statusCode, 200, shipped.body);
