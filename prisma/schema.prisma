@@ -340,36 +340,57 @@ enum RetailOrderStatus {
   CANCELLED
 }
 
-model RetailOrder {
-  id                String            @id @default(cuid())
-  customerId        String
-  status            RetailOrderStatus @default(PENDING)
-  subtotal          Decimal           @db.Decimal(12, 2)
-  total             Decimal           @db.Decimal(12, 2)
-  shippingAddressId String?
-  // Order history must survive: customers/addresses referenced by an order cannot be deleted.
-  customer          Customer          @relation(fields: [customerId], references: [id], onDelete: Restrict)
-  shippingAddress   RetailAddress?    @relation(fields: [shippingAddressId], references: [id], onDelete: Restrict)
-  items             RetailOrderItem[]
-  createdAt         DateTime          @default(now())
-  updatedAt         DateTime          @updatedAt
+// Payment is tracked separately from fulfilment. Only a verified payment-provider confirmation may move an order
+// to PAID; nothing in the API does that yet, so every order is UNPAID.
+enum RetailPaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+}
 
+model RetailOrder {
+  id                      String              @id @default(cuid())
+  customerId              String
+  status                  RetailOrderStatus   @default(PENDING)
+  paymentStatus           RetailPaymentStatus @default(UNPAID)
+  subtotal                Decimal             @db.Decimal(12, 2)
+  shippingTotal           Decimal             @default(0) @db.Decimal(12, 2)
+  total                   Decimal             @db.Decimal(12, 2)
+  shippingMethod          String?             @db.VarChar(32)
+  // Copy of the address at order time, so editing an address later never rewrites past orders.
+  shippingAddressSnapshot Json?
+  note                    String?             @db.Text
+  // Client-chosen key (Idempotency-Key header): a retried request returns the order it already created.
+  idempotencyKey          String?             @db.VarChar(64)
+  shippingAddressId       String?
+  // Order history must survive: customers/addresses referenced by an order cannot be deleted.
+  customer                Customer            @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  shippingAddress         RetailAddress?      @relation(fields: [shippingAddressId], references: [id], onDelete: Restrict)
+  items                   RetailOrderItem[]
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+
+  @@unique([customerId, idempotencyKey])
   @@index([customerId, createdAt])
   @@index([status, createdAt])
   @@index([shippingAddressId])
 }
 
 model RetailOrderItem {
-  id        String          @id @default(cuid())
-  orderId   String
-  productId String
-  variantId String?
-  quantity  Int
+  id          String          @id @default(cuid())
+  orderId     String
+  productId   String
+  variantId   String?
+  quantity    Int
   // Price at time of purchase, not a live reference to the catalogue price.
-  unitPrice Decimal         @db.Decimal(12, 2)
-  order     RetailOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  product   Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
-  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  unitPrice   Decimal         @db.Decimal(12, 2)
+  // Names and SKU at time of purchase (the catalogue may be edited later).
+  productName String?         @db.VarChar(191)
+  variantName String?         @db.VarChar(191)
+  sku         String?         @db.VarChar(191)
+  order       RetailOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
 
   @@index([orderId])
   @@index([productId])
