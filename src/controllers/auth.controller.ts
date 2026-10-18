@@ -99,5 +99,33 @@ export function createAuthController(service: AuthService) {
       const user = await service.getSafeUser((request.user as { sub: string }).sub);
       return { success: true, data: user };
     },
+
+    async sendLoginOtp(request: FastifyRequest) {
+      await service.sendLoginOtp((request.body as { email: string }).email);
+      return { success: true, data: { message: "If an account exists for this email, a verification code has been sent." } };
+    },
+
+    async verifyLoginOtp(request: FastifyRequest, reply: FastifyReply) {
+      const { email, otp } = request.body as { email: string; otp: string };
+      const user = await service.verifyLoginOtp(email, otp);
+      return { success: true, data: await issueToken(reply, user) };
+    },
+
+    async forgotPasswordSendOtp(request: FastifyRequest) {
+      await service.forgotPasswordSendOtp((request.body as { email: string }).email);
+      return { success: true, data: { message: "If an account exists for this email, a verification code has been sent." } };
+    },
+
+    async forgotPasswordVerifyOtp(request: FastifyRequest) {
+      const { email, otp } = request.body as { email: string; otp: string };
+      await service.forgotPasswordVerifyOtp(email, otp);
+      return { success: true, data: { verified: true } };
+    },
+
+    async forgotPasswordReset(request: FastifyRequest) {
+      const { email, otp, newPassword } = request.body as { email: string; otp: string; newPassword: string };
+      await service.resetPasswordWithOtp(email, otp, newPassword);
+      return { success: true, data: { message: "Password has been reset successfully." } };
+    },
   };
 }

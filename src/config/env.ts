@@ -45,6 +45,15 @@ export const env = {
   DATABASE_TLS_SERVERNAME: process.env.DATABASE_TLS_SERVERNAME,
   AUTH_RATE_LIMIT_MAX: Number(process.env.AUTH_RATE_LIMIT_MAX ?? 10),
   AUTH_RATE_LIMIT_WINDOW: process.env.AUTH_RATE_LIMIT_WINDOW ?? "1 minute",
+  // Tighter than AUTH_RATE_LIMIT_*: OTP send/verify is more abuse-prone (each send costs an
+  // email, each verify is a guess against a 6-digit code) than a plain login attempt.
+  OTP_RATE_LIMIT_MAX: Number(process.env.OTP_RATE_LIMIT_MAX ?? 5),
+  OTP_RATE_LIMIT_WINDOW: process.env.OTP_RATE_LIMIT_WINDOW ?? "10 minutes",
+  OTP_EXPIRY_MINUTES: Number(process.env.OTP_EXPIRY_MINUTES ?? 5),
+  OTP_MAX_ATTEMPTS: Number(process.env.OTP_MAX_ATTEMPTS ?? 5),
+  OTP_RESEND_COOLDOWN_SECONDS: Number(process.env.OTP_RESEND_COOLDOWN_SECONDS ?? 60),
+  // How long a completed checkout/payment OTP verification authorizes a payment attempt for.
+  CHECKOUT_VERIFICATION_TTL_MINUTES: Number(process.env.CHECKOUT_VERIFICATION_TTL_MINUTES ?? 15),
   get GOOGLE_CLIENT_ID() { return required("GOOGLE_CLIENT_ID"); },
   get GOOGLE_CLIENT_SECRET() { return required("GOOGLE_CLIENT_SECRET"); },
   // Backend callback registered with Google, e.g. http://localhost:4000/api/v1/auth/google/callback
@@ -53,6 +62,8 @@ export const env = {
   // error), e.g. http://localhost:3000/account/google/callback/
   get GOOGLE_FRONTEND_CALLBACK_URL() { return required("GOOGLE_FRONTEND_CALLBACK_URL"); },
   get DATABASE_URL() { return required("DATABASE_URL"); },
+  get RESEND_API_KEY() { return required("RESEND_API_KEY"); },
+  get RESEND_FROM_EMAIL() { return required("RESEND_FROM_EMAIL"); },
   get JWT_SECRET() {
     const secret = required("JWT_SECRET");
     if (secret.length < 32) throw new Error("JWT_SECRET must be at least 32 characters");

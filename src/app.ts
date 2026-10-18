@@ -12,6 +12,7 @@ import { requireAdmin, requireCustomer } from "./middleware/auth.middleware.js";
 import { registerErrorHandler } from "./middleware/error.middleware.js";
 import { healthRoutes } from "./routes/health.routes.js";
 import { authRoutes } from "./routes/auth.routes.js";
+import { checkoutRoutes } from "./routes/checkout.routes.js";
 import { adminRoutes } from "./routes/admin.routes.js";
 import { productRoutes } from "./routes/product.routes.js";
 import { categoryRoutes } from "./routes/category.routes.js";
@@ -43,6 +44,7 @@ export async function buildApp() {
   app.decorateRequest("requireCustomer", function () { return requireCustomer(this); });
   await app.register(healthRoutes);
   await app.register(authRoutes);
+  await app.register(checkoutRoutes);
   await app.register(adminRoutes);
   await app.register(productRoutes);
   await app.register(categoryRoutes);

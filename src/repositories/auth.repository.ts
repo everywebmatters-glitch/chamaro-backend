@@ -21,6 +21,9 @@ export function createAuthRepository(prisma: PrismaClient) {
     // Upsert so admins created before their profile existed self-heal on next login.
     recordAdminLogin: (userId: string) =>
       prisma.adminUser.upsert({ where: { userId }, update: { lastLoginAt: new Date() }, create: { userId, lastLoginAt: new Date() } }),
+
+    updatePassword: (userId: string, passwordHash: string) =>
+      prisma.user.update({ where: { id: userId }, data: { passwordHash } }),
   };
 }
 

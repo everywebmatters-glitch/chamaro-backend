@@ -24,19 +24,59 @@ enum PageStatus {
 }
 
 model User {
-  id           String     @id @default(cuid())
-  name         String
-  email        String     @unique @db.VarChar(191)
-  googleId     String?    @unique @db.VarChar(191)
-  passwordHash String
-  role         Role       @default(ADMIN)
-  isActive     Boolean    @default(true)
-  adminProfile AdminUser?
-  customer     Customer?
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  id                   String                @id @default(cuid())
+  name                 String
+  email                String                @unique @db.VarChar(191)
+  googleId             String?               @unique @db.VarChar(191)
+  passwordHash         String
+  role                 Role                  @default(ADMIN)
+  isActive             Boolean               @default(true)
+  adminProfile         AdminUser?
+  customer             Customer?
+  checkoutVerification CheckoutVerification?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
 
   @@index([role, isActive])
+}
+
+enum OtpPurpose {
+  LOGIN
+  FORGOT_PASSWORD
+  CHECKOUT_PAYMENT
+  EMAIL_VERIFICATION
+}
+
+// Email-delivered one-time codes for login, password reset, and checkout/payment
+// authorization. otpHash uses the same scrypt format as User.passwordHash -- the plaintext
+// code is never stored. consumedAt marks a code used (directly, or invalidated by a newer
+// code for the same email+purpose) so it can never be verified again.
+model EmailOtp {
+  id         String     @id @default(cuid())
+  email      String     @db.VarChar(191)
+  purpose    OtpPurpose
+  otpHash    String
+  // Set only for codes issued to an already-authenticated user (checkout), as an extra binding
+  // check alongside email.
+  userId     String?
+  expiresAt  DateTime
+  attempts   Int        @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime   @default(now())
+
+  @@index([email, purpose, consumedAt])
+  @@index([userId, purpose])
+}
+
+// Short-lived proof that an authenticated customer completed checkout/payment OTP
+// verification. Payment-initiation code must look this up (and consume it) before starting a
+// payment -- a client-supplied "otpVerified" flag must never be trusted on its own.
+model CheckoutVerification {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
 }
 
 // Admin-domain profile. Identity/credentials stay on User; authorization still keys off User.role.

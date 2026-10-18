@@ -10,6 +10,6 @@ export async function registerCors(app: FastifyInstance): Promise<void> {
     credentials: true,
     // @fastify/cors v11 only allows GET, HEAD and POST by default, which made browsers block
     // every admin PUT/DELETE (products, categories, media) at the preflight.
-    methods: ["GET", "HEAD", "POST", "PUT", "DELETE"],
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
 }

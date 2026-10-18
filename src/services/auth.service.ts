@@ -1,6 +1,7 @@
 import type { PrismaClient } from "../../generated/prisma/client.js";
 import { hashPassword, verifyPasswordConstantWork } from "../utils/password.js";
 import { createAuthRepository } from "../repositories/auth.repository.js";
+import { createOtpService } from "./otp.service.js";
 import { googleProvider } from "../providers/google.provider.js";
 import type { AdminLoginInput, GoogleIdentity, LoginInput, RegisterInput, SafeUser } from "../types/auth.types.js";
 
@@ -16,6 +17,7 @@ function googleAccountNotLinked(): Error {
 
 export function createAuthService(prisma: PrismaClient) {
   const repository = createAuthRepository(prisma);
+  const otpService = createOtpService(prisma);
 
   async function loginWithGoogle(identity: GoogleIdentity) {
     let user = await repository.findByGoogleId(identity.googleId);
@@ -87,6 +89,53 @@ export function createAuthService(prisma: PrismaClient) {
       if (!user) throw Object.assign(new Error("Invalid or expired sign-in code"), { statusCode: 401, code: "OAUTH_CODE_INVALID" });
       if (!user.isActive) throw accountInactive();
       return user;
+    },
+
+    // Only ever sends when the account exists, is active, and is a CUSTOMER -- but always
+    // returns the same outcome to the caller either way, so the response never discloses
+    // whether an account exists for this email (same enumeration-avoidance stance as login()).
+    async sendLoginOtp(email: string): Promise<void> {
+      const normalized = email.trim().toLowerCase();
+      const user = await repository.findByEmail(normalized);
+      if (user && user.isActive && user.role === "CUSTOMER") {
+        await otpService.sendOtp({ email: normalized, purpose: "LOGIN" });
+      }
+    },
+
+    async verifyLoginOtp(email: string, otp: string) {
+      const normalized = email.trim().toLowerCase();
+      await otpService.verifyOtp({ email: normalized, purpose: "LOGIN", otp });
+      const user = await repository.findByEmail(normalized);
+      // The OTP matched, but the account could have been deactivated/role-changed since it was
+      // sent; treat that the same as any other login failure.
+      if (!user || !user.isActive || user.role !== "CUSTOMER") throw invalidCredentials();
+      return user;
+    },
+
+    // Same enumeration-avoidance stance as sendLoginOtp(): always the same outcome regardless
+    // of whether the email has an account.
+    async forgotPasswordSendOtp(email: string): Promise<void> {
+      const normalized = email.trim().toLowerCase();
+      const user = await repository.findByEmail(normalized);
+      if (user && user.isActive) {
+        await otpService.sendOtp({ email: normalized, purpose: "FORGOT_PASSWORD" });
+      }
+    },
+
+    // Non-consuming check: lets the frontend show "code accepted" before collecting the new
+    // password. reset() below re-validates and performs the actual consumption.
+    async forgotPasswordVerifyOtp(email: string, otp: string): Promise<void> {
+      const normalized = email.trim().toLowerCase();
+      await otpService.verifyOtp({ email: normalized, purpose: "FORGOT_PASSWORD", otp, consume: false });
+    },
+
+    async resetPasswordWithOtp(email: string, otp: string, newPassword: string): Promise<void> {
+      const normalized = email.trim().toLowerCase();
+      await otpService.verifyOtp({ email: normalized, purpose: "FORGOT_PASSWORD", otp, consume: true });
+      const user = await repository.findByEmail(normalized);
+      if (!user || !user.isActive) throw accountInactive();
+      const passwordHash = await hashPassword(newPassword);
+      await repository.updatePassword(user.id, passwordHash);
     },
   };
 }

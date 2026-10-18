@@ -151,41 +151,48 @@ export async function runDatabaseDiagnostic(): Promise<void> {
   const host = url.hostname;
   const port = Number(url.port || 3306);
   const database = url.pathname.slice(1);
+  // Cloud Run's native Cloud SQL integration connects over a Unix socket, not host:port: there is
+  // nothing for the TCP/TLS probes below to reach, and the proxy already terminates TLS itself.
+  const socketPath = url.searchParams.get("socket") ?? undefined;
   let ssl: ReturnType<typeof getDatabaseSslOptions>;
   try {
-    ssl = getDatabaseSslOptions(host);
+    ssl = socketPath ? undefined : getDatabaseSslOptions(host);
   } catch (error) {
     log("config", { ok: false, host, port, database, step: "TLS options", error: describeError(error, scrub) });
     return;
   }
-  log("config", { ok: true, host, port, database, tlsEnabled: ssl !== undefined, tlsCustomCa: Boolean(ssl?.ca), tlsCaSource: !ssl ? null : env.DATABASE_CA_CERT?.trim() ? "DATABASE_CA_CERT" : env.DATABASE_CA_CERT_PATH ? "DATABASE_CA_CERT_PATH" : "none", tlsServername: ssl?.servername ?? null, tlsRejectUnauthorized: ssl?.rejectUnauthorized ?? null });
+  log("config", { ok: true, host, port, database, socketPath: socketPath ?? null, tlsEnabled: ssl !== undefined, tlsCustomCa: Boolean(ssl?.ca), tlsCaSource: !ssl ? null : env.DATABASE_CA_CERT?.trim() ? "DATABASE_CA_CERT" : env.DATABASE_CA_CERT_PATH ? "DATABASE_CA_CERT_PATH" : "none", tlsServername: ssl?.servername ?? null, tlsRejectUnauthorized: ssl?.rejectUnauthorized ?? null });
 
-  const tcp = await tcpProbe(host, port);
-  if (!tcp.ok) {
-    log("tcp", { ok: false, ms: tcp.ms, error: describeError(tcp.error, scrub) });
-    return;
-  }
-  log("tcp", { ok: true, ms: tcp.ms });
+  if (!socketPath) {
+    const tcp = await tcpProbe(host, port);
+    if (!tcp.ok) {
+      log("tcp", { ok: false, ms: tcp.ms, error: describeError(tcp.error, scrub) });
+      return;
+    }
+    log("tcp", { ok: true, ms: tcp.ms });
 
-  if (ssl) {
-    try {
-      log("tlsPeerCertificate", { configuredCa: describeConfiguredCa(ssl.ca), ...(await peerCertificateProbe(host, port, ssl.ca, ssl.servername)) });
-    } catch (error) {
-      log("tlsPeerCertificate", { ok: false, error: describeError(error, scrub) });
+    if (ssl) {
+      try {
+        log("tlsPeerCertificate", { configuredCa: describeConfiguredCa(ssl.ca), ...(await peerCertificateProbe(host, port, ssl.ca, ssl.servername)) });
+      } catch (error) {
+        log("tlsPeerCertificate", { ok: false, error: describeError(error, scrub) });
+      }
     }
   }
 
   // MariaDB driver directly: authentication, TLS and unknown-database errors keep their own codes here.
-  const driverOptions = { host, port, user, password, database, ssl, connectTimeout: 10_000 };
+  const driverOptions = socketPath
+    ? { socketPath, user, password, database, connectTimeout: 10_000 }
+    : { host, port, user, password, database, ssl, connectTimeout: 10_000 };
   // The exact options object handed to the driver, minus credentials. The driver upgrades to TLS
   // with tls.connect({ ...ssl, socket }), so ssl.servername is the only host Node's certificate
   // name check can see; without it Node checks against its default, "localhost".
-  const tlsOptions = driverOptions.ssl;
+  const tlsOptions = socketPath ? undefined : ssl;
   log("mariadbConnectionOptions", {
-    host: driverOptions.host,
-    port: driverOptions.port,
-    database: driverOptions.database,
-    socketPath: (driverOptions as { socketPath?: string }).socketPath ?? null,
+    host: socketPath ? null : host,
+    port: socketPath ? null : port,
+    database,
+    socketPath: socketPath ?? null,
     tlsEnabled: tlsOptions !== undefined,
     tlsCustomCa: Boolean(tlsOptions?.ca),
     tlsServername: tlsOptions?.servername ?? null,
@@ -209,7 +216,11 @@ export async function runDatabaseDiagnostic(): Promise<void> {
   // Prisma through the adapter, outside a transaction, so its 2s transaction wait doesn't hide the result.
   const prismaStarted = Date.now();
   const prisma = new PrismaClient({
-    adapter: new PrismaMariaDb({ host, port, user, password, database, connectionLimit: 1, ssl, connectTimeout: 10_000, acquireTimeout: 10_000 }),
+    adapter: new PrismaMariaDb(
+      socketPath
+        ? { socketPath, user, password, database, connectionLimit: 1, connectTimeout: 10_000, acquireTimeout: 10_000 }
+        : { host, port, user, password, database, connectionLimit: 1, ssl, connectTimeout: 10_000, acquireTimeout: 10_000 },
+    ),
   });
   try {
     await prisma.$queryRaw`SELECT 1`;
