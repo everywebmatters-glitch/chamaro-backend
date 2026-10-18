@@ -3,7 +3,6 @@ dist
 generated
 .env
 .env.*
-!.env.example
 client_secret_*.json
 certs
 tests
