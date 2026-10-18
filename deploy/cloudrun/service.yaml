@@ -1,40 +1,66 @@
-# Cloud Run service for the Chamaro API. Replace every <PLACEHOLDER>, then:
-#   gcloud run services replace deploy/cloudrun/service.yaml --region asia-south1
-# GOOGLE_* and RESEND_* values come from Secret Manager (not literals) so a `services replace` can never revert them.
-# The Cloud SQL Auth Proxy runs beside the API and listens on 127.0.0.1:3306, so DATABASE_URL
-# points at 127.0.0.1 and config/database-ssl.ts skips client TLS (the proxy encrypts to Cloud SQL).
+# Cloud Run service for the Chamaro API -- a record of the live configuration (exported 2026-10-18) plus APP_BASE_URL.
+# Release with `gcloud run deploy --image ...` as in README.md, which keeps every live setting and the traffic split.
+# Do NOT `gcloud run services replace` this file without first diffing it against
+# `gcloud run services describe chamaro-api --region asia-south1 --format export`: replace drops anything missing here
+# and moves 100% of traffic to the new revision.
+# The database is reached through Cloud Run's built-in Cloud SQL connection (the cloudsql-instances annotation), so
+# DATABASE_URL uses the socket form mysql://user:pass@localhost/db?socket=/cloudsql/<connection name>
+# (see src/plugins/prisma.ts). Every secret comes from Secret Manager; no secret value is written here.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
   name: chamaro-api
   annotations:
-    run.googleapis.com/launch-stage: BETA
+    run.googleapis.com/ingress: all
 spec:
   template:
     metadata:
       annotations:
         autoscaling.knative.dev/minScale: "0"
-        autoscaling.knative.dev/maxScale: "3"
-        # Start the API only after the proxy reports ready.
-        run.googleapis.com/container-dependencies: '{"api":["cloud-sql-proxy"]}'
+        autoscaling.knative.dev/maxScale: "20"
+        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+        run.googleapis.com/cpu-throttling: "true"
+        run.googleapis.com/startup-cpu-boost: "true"
     spec:
       serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
       containerConcurrency: 80
-      timeoutSeconds: 60
+      timeoutSeconds: 300
       containers:
-        - name: api
-          image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro/chamaro-backend:<TAG>
+        - image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-api:<TAG>
+          command: ["node"]
+          args: ["dist/src/server.js"]
           ports:
-            - containerPort: 8080
+            - name: http1
+              containerPort: 8080
           env:
             - name: APP_ENV
               value: production
-            - name: CORS_ORIGIN
-              value: https://chamaro-admin-477932129337.asia-south1.run.app,https://chamaro-webapp-477932129337.asia-south1.run.app
+            - name: HOST
+              value: 0.0.0.0
+            - name: NODE_ENV
+              value: production
+            # Customer storefront for email links (password reset). Never the admin domain.
+            - name: APP_BASE_URL
+              value: https://chamaro.com
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: DATABASE_URL
+                  key: latest
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: JWT_SECRET
+                  key: latest
             - name: GOOGLE_CLIENT_ID
               valueFrom:
                 secretKeyRef:
                   name: GOOGLE_CLIENT_ID
+                  key: latest
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: GOOGLE_CLIENT_SECRET
                   key: latest
             - name: GOOGLE_REDIRECT_URI
               valueFrom:
@@ -45,21 +71,6 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: GOOGLE_FRONTEND_CALLBACK_URL
-                  key: latest
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: chamaro-database-url
-                  key: latest
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: chamaro-jwt-secret
-                  key: latest
-            - name: GOOGLE_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: GOOGLE_CLIENT_SECRET
                   key: latest
             # Read only when an email is sent (the Resend client is created lazily), but every email needs both.
             - name: RESEND_API_KEY
@@ -72,34 +83,19 @@ spec:
                 secretKeyRef:
                   name: RESEND_FROM_EMAIL
                   key: latest
-            # Customer storefront for email links (password reset). Never the admin domain.
-            - name: APP_BASE_URL
-              value: https://chamaro.com
+            # Admin and storefront origins (https://admin.chamaro.com, https://chamaro.com, ...).
+            - name: CORS_ORIGIN
+              valueFrom:
+                secretKeyRef:
+                  name: CORS_ORIGIN
+                  key: latest
           resources:
             limits:
-              cpu: "1"
+              cpu: 1000m
               memory: 512Mi
           startupProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: 8080
-            periodSeconds: 3
-            failureThreshold: 10
-        - name: cloud-sql-proxy
-          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.0
-          args:
-            - --port=3306
-            - --health-check
-            - --http-address=0.0.0.0
-            - --http-port=9090
-            - project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
-          resources:
-            limits:
-              cpu: "0.5"
-              memory: 256Mi
-          startupProbe:
-            httpGet:
-              path: /startup
-              port: 9090
-            periodSeconds: 2
-            failureThreshold: 15
+            periodSeconds: 240
+            timeoutSeconds: 240
+            failureThreshold: 1

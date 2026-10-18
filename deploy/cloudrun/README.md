@@ -1,87 +1,68 @@
 # Deploying the backend to Google Cloud Run
 
-The API runs on **Cloud Run** with a **Cloud SQL (MySQL 8)** database. A Cloud SQL Auth Proxy
-sidecar sits next to the API container, so the database needs no public IP allowlist and
-`DATABASE_URL` points at `127.0.0.1:3306` (see `src/config/database-ssl.ts`).
+The API runs on **Cloud Run** (service `chamaro-api`, region `asia-south1`, project
+`project-2e1ca4ee-4c62-4f01-a4c`) with a **Cloud SQL for MySQL 8.4** database (instance
+`free-trial-first-project`). Cloud Run's built-in Cloud SQL connection mounts the instance's Unix
+socket, so `DATABASE_URL` has the form
+`mysql://user:pass@localhost/db?socket=/cloudsql/project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project`
+(see `src/plugins/prisma.ts`). There is no proxy sidecar.
 
 | File | Purpose |
 | --- | --- |
-| `Dockerfile` (repo root) | `runtime` target: the API image. `migrate` target: Prisma CLI for migrations. |
-| `deploy/cloudrun/service.yaml` | Cloud Run service `chamaro-api` (already exists): API + Cloud SQL proxy sidecar. |
-| `deploy/cloudrun/migrate-job.yaml` | Cloud Run job that runs `prisma migrate deploy`. |
+| `Dockerfile` (repo root) | `runtime` target: the API image. `migrate` target: Prisma CLI, schema and migrations. |
+| `deploy/cloudrun/cloudbuild.yaml` | Builds both images for one commit, checks their contents, smoke-tests the API image, pushes both. |
+| `deploy/cloudrun/service.yaml` | Record of the live `chamaro-api` configuration. Not applied directly (see below). |
+| `deploy/cloudrun/migrate-job.yaml` | Cloud Run job `chamaro-migrate` that runs `prisma migrate deploy`. |
 
-## What you need
+Images live in `asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images`
+(`chamaro-api`, `chamaro-migrate`), tagged with the short Git commit. Never deploy `latest`.
 
-- A Google Cloud project with billing enabled, and a region (for example `asia-south1`).
-- A Cloud SQL for MySQL instance (existing or new), a database and a user for the app.
-- Values for: `DATABASE_URL`, `JWT_SECRET` (32+ random characters), `GOOGLE_CLIENT_ID`,
-  `GOOGLE_CLIENT_SECRET`, `CORS_ORIGIN` (admin and web origins, comma separated),
-  `GOOGLE_REDIRECT_URI` and `GOOGLE_FRONTEND_CALLBACK_URL`.
-
-## One-time setup
-
-```sh
-PROJECT_ID=project-2e1ca4ee-4c62-4f01-a4c
-REGION=asia-south1
-INSTANCE=free-trial-first-project   # MySQL 8.4, Enterprise Plus
-gcloud config set project $PROJECT_ID
-
-gcloud services enable run.googleapis.com sqladmin.googleapis.com \
-  artifactregistry.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com
-
-gcloud artifacts repositories create chamaro --repository-format=docker --location=$REGION
-
-# Runtime identity for the service and the migration job.
-gcloud iam service-accounts create chamaro-backend
-SA=chamaro-backend@$PROJECT_ID.iam.gserviceaccount.com
-gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$SA --role=roles/cloudsql.client
-
-# Database: the instance exists already, so skip `instances create`; create the database and user if missing.
-gcloud sql instances create $INSTANCE --database-version=MYSQL_8_0 --region=$REGION --tier=db-f1-micro
-gcloud sql databases create chamaro --instance=$INSTANCE
-gcloud sql users create chamaro --instance=$INSTANCE --password='<db-password>'
-
-# Secrets. DATABASE_URL always uses 127.0.0.1 (the proxy sidecar); URL-encode the password.
-printf 'mysql://chamaro:<db-password>@127.0.0.1:3306/chamaro' | gcloud secrets create chamaro-database-url --data-file=-
-openssl rand -base64 48 | tr -d '\n' | gcloud secrets create chamaro-jwt-secret --data-file=-
-printf '<google-client-secret>' | gcloud secrets create chamaro-google-client-secret --data-file=-
-for s in chamaro-database-url chamaro-jwt-secret chamaro-google-client-secret; do
-  gcloud secrets add-iam-policy-binding $s --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
-done
-```
+Secrets (Secret Manager, read by the `chamaro-backend` service account): `DATABASE_URL`, `JWT_SECRET`,
+`CORS_ORIGIN`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`,
+`GOOGLE_FRONTEND_CALLBACK_URL`, `RESEND_API_KEY`, `RESEND_FROM_EMAIL`. Plain settings: `APP_ENV`, `NODE_ENV`,
+`HOST`, `APP_BASE_URL` (`https://chamaro.com`), optional `PASSWORD_RESET_TOKEN_TTL_MINUTES` (5-120, default 30).
 
 ## Each release
 
+Run from a clean working tree on the commit being released.
+
 ```sh
+P=project-2e1ca4ee-4c62-4f01-a4c; R=asia-south1
 TAG=$(git rev-parse --short HEAD)
-REPO=$REGION-docker.pkg.dev/$PROJECT_ID/chamaro
+REPO=$R-docker.pkg.dev/$P/chamaro-images
 
-# Build both images with Cloud Build (no local Docker needed).
-gcloud builds submit --tag $REPO/chamaro-backend:$TAG .   # builds the last stage, `runtime`
-# The migrate image needs --target; with Docker locally:
-docker build --target migrate -t $REPO/chamaro-migrate:$TAG . && docker push $REPO/chamaro-migrate:$TAG
+# 1. Build, check and push both images (Cloud Build; no local Docker needed).
+gcloud builds submit --project $P --region $R --config deploy/cloudrun/cloudbuild.yaml --substitutions _TAG=$TAG .
 
-# Fill the placeholders in both YAML files (PROJECT_ID, TAG, URLs), then:
-gcloud run jobs replace deploy/cloudrun/migrate-job.yaml --region $REGION
-gcloud run jobs execute chamaro-migrate --region $REGION --wait
-# chamaro-api already exists: compare with its live config first so no env var is lost.
-gcloud run services describe chamaro-api --region $REGION --format export > live-chamaro-api.yaml
-gcloud run services replace deploy/cloudrun/service.yaml --region $REGION
-gcloud run services add-iam-policy-binding chamaro-api --region $REGION \
-  --member=allUsers --role=roles/run.invoker   # public API
+# 2. Point the migration job at this commit's migrate image (creates the job the first time).
+sed "s/<TAG>/$TAG/" deploy/cloudrun/migrate-job.yaml > /tmp/migrate-job.yaml
+gcloud run jobs replace /tmp/migrate-job.yaml --project $P --region $R
+
+# 3. Read-only: list applied and pending migrations. Changes nothing.
+gcloud run jobs execute chamaro-migrate --project $P --region $R --wait --args=migrate,status
+#    Then read the execution's logs in Cloud Logging.
+
+# 4. Only if migrations are pending: take a backup first, then apply them.
+gcloud sql backups create --project $P --instance free-trial-first-project --description "before $TAG"
+gcloud run jobs execute chamaro-migrate --project $P --region $R --wait
+
+# 5. New revision with no traffic; every other live setting and secret reference is kept.
+gcloud run deploy chamaro-api --project $P --region $R --image $REPO/chamaro-api:$TAG \
+  --update-env-vars APP_BASE_URL=https://chamaro.com --no-traffic --tag c$TAG
+#    Test it at the tagged URL printed by the command, then move traffic:
+gcloud run services update-traffic chamaro-api --project $P --region $R --to-tags c$TAG=100
 ```
 
-First deploy only: create the admin account by running `npm run admin:create` against the
-database (for example through `cloud-sql-proxy` on your machine), or seed with `npm run prisma:seed`.
+Rollback: `gcloud run services update-traffic chamaro-api --region $R --to-revisions <previous revision>=100`.
+Migrations are additive, so the previous revision keeps working on the migrated schema.
 
-After deploying, add the Cloud Run URL (or your custom domain) callback to the Google OAuth client's
-authorized redirect URIs, and point the admin and web frontends at the new API URL.
+Do not `gcloud run services replace deploy/cloudrun/service.yaml` unless it has first been diffed against
+`gcloud run services describe chamaro-api --region $R --format export`: replace drops any setting missing from the
+file and moves all traffic to the new revision at once.
 
 ## Notes
 
-- Swagger (`/docs`) is off in production, as before. `/health` is the startup probe.
-- Request logs record `remoteAddress`; check after the first deploy that it shows real visitor
-  IPs, since the login rate limit keys on it (`trustProxy` in `src/app.ts` trusts link-local and
-  private proxies, which should cover Cloud Run's front end).
-- The temporary Hostinger startup and database diagnostics in `src/server.ts` still run and log
-  only non-secret values; they can be removed once the move is done.
+- Swagger (`/docs`) is off in production. `/health` does not touch the database.
+- Migrations never run at application startup; only the `chamaro-migrate` job applies them.
+- Request logs record `remoteAddress`; the login rate limit keys on it (`trustProxy` in `src/app.ts`).
+- The temporary startup and database diagnostics in `src/server.ts` log only non-secret values.

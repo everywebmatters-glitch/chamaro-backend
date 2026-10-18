@@ -1,42 +1,43 @@
-# Cloud Run job that applies Prisma migrations (`prisma migrate deploy`). Replace every <PLACEHOLDER>, then:
+# Cloud Run job that applies Prisma migrations to the production database. Create or update it with
 #   gcloud run jobs replace deploy/cloudrun/migrate-job.yaml --region asia-south1
+# (after replacing <TAG> with the same commit tag as the API image). It uses the same service account, Cloud SQL
+# connection and DATABASE_URL secret as the chamaro-api service, so it migrates exactly the database the API uses.
+#
+# By default an execution runs `prisma migrate deploy` (applies pending migrations; never `migrate dev`, `db push`
+# or a reset). Check first without changing anything, by overriding the arguments for one execution:
+#   gcloud run jobs execute chamaro-migrate --region asia-south1 --wait --args=migrate,status
+# Only then, after a fresh backup (see README.md):
 #   gcloud run jobs execute chamaro-migrate --region asia-south1 --wait
-# The proxy runs with --quitquitquit so the job can stop it when migrations finish.
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
   name: chamaro-migrate
-  annotations:
-    run.googleapis.com/launch-stage: BETA
 spec:
   template:
+    metadata:
+      annotations:
+        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
     spec:
       taskCount: 1
+      parallelism: 1
       template:
         spec:
           serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+          # A failed migration is never retried automatically; it needs a person to look at it.
           maxRetries: 0
           timeoutSeconds: 600
           containers:
             - name: migrate
-              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro/chamaro-migrate:<TAG>
-              command: ["sh", "-c"]
-              args:
-                - >-
-                  until node -e "require('net').connect(3306,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"; do sleep 1; done;
-                  npx prisma migrate deploy; status=$?;
-                  node -e "fetch('http://127.0.0.1:9091/quitquitquit',{method:'POST'}).catch(()=>{})";
-                  exit $status
+              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-migrate:<TAG>
+              command: ["npx", "--no-install", "prisma"]
+              args: ["migrate", "deploy"]
               env:
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef:
-                      name: chamaro-database-url
+                      name: DATABASE_URL
                       key: latest
-            - name: cloud-sql-proxy
-              image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.0
-              args:
-                - --port=3306
-                - --quitquitquit
-                - --admin-port=9091
-                - project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+              resources:
+                limits:
+                  cpu: 1000m
+                  memory: 512Mi

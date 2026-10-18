@@ -1,0 +1,78 @@
+# Builds, checks and pushes the API and migration images for one commit. No local Docker needed:
+#   TAG=$(git rev-parse --short HEAD)   # from a clean working tree, so the image is exactly that commit
+#   gcloud builds submit --config deploy/cloudrun/cloudbuild.yaml --substitutions _TAG=$TAG .
+# Images are pushed only if every step passes. Nothing here touches Cloud Run or the database.
+substitutions:
+  _REPO: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images
+  _TAG: ""
+
+steps:
+  - id: require-tag
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args: ["-c", 'test -n "${_TAG}" || { echo "pass --substitutions _TAG=<git short sha>"; exit 1; }']
+
+  - id: build-runtime
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "--target", "runtime", "-t", "${_REPO}/chamaro-api:${_TAG}", "."]
+
+  - id: build-migrate
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "--target", "migrate", "-t", "${_REPO}/chamaro-migrate:${_TAG}", "."]
+
+  # The runtime image holds the compiled app and Prisma Client, and no .env file.
+  - id: check-runtime-contents
+    name: gcr.io/cloud-builders/docker
+    args:
+      - run
+      - --rm
+      - --entrypoint
+      - sh
+      - ${_REPO}/chamaro-api:${_TAG}
+      - -c
+      - test -f dist/src/server.js && test -f dist/generated/prisma/client.js && test ! -e .env && test ! -d src && test ! -d tests && echo runtime image contents OK
+
+  # Production startup smoke test: the image starts with APP_ENV=production and serves /health (which needs no
+  # database; nothing listens on the placeholder database address), and Swagger stays off.
+  - id: smoke-runtime
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        docker run -d --name api-smoke \
+          -e APP_ENV=production -e NODE_ENV=production -e PORT=8080 -e HOST=0.0.0.0 \
+          -e DATABASE_URL=mysql://smoke:smoke@127.0.0.1:3306/smoke \
+          -e JWT_SECRET=cloud-build-smoke-test-only-0123456789abcdef \
+          -e CORS_ORIGIN=https://chamaro.com,https://admin.chamaro.com \
+          -e APP_BASE_URL=https://chamaro.com \
+          ${_REPO}/chamaro-api:${_TAG}
+        probe='fetch("http://127.0.0.1:8080"+process.argv[1]).then(r=>{console.log(process.argv[1],r.status);process.exit(r.status===Number(process.argv[2])?0:1)}).catch(()=>process.exit(1))'
+        ok=0
+        for i in $$(seq 1 30); do
+          if docker exec api-smoke node -e "$$probe" /health 200; then ok=1; break; fi
+          sleep 1
+        done
+        if [ "$$ok" = 1 ]; then docker exec api-smoke node -e "$$probe" /docs 404 || ok=0; fi
+        docker logs api-smoke 2>&1 | tail -20
+        docker rm -f api-smoke >/dev/null
+        test "$$ok" = 1
+
+  # The migration image holds the Prisma CLI, schema, config and every migration.
+  - id: check-migrate-contents
+    name: gcr.io/cloud-builders/docker
+    args:
+      - run
+      - --rm
+      - -e
+      - DATABASE_URL=mysql://check:check@127.0.0.1:3306/check
+      - --entrypoint
+      - sh
+      - ${_REPO}/chamaro-migrate:${_TAG}
+      - -c
+      - npx --no-install prisma --version && test -f prisma.config.ts && test -f prisma/schema.prisma && ls prisma/migrations && test -f prisma/migrations/migration_lock.toml && test ! -e .env
+
+images:
+  - ${_REPO}/chamaro-api:${_TAG}
+  - ${_REPO}/chamaro-migrate:${_TAG}
