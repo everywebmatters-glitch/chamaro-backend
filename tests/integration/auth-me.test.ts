@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { isolatedDatabaseSkipReason } from "../helpers/throwaway-db.js";
+import { registerWithCode } from "../helpers/signup.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
@@ -24,7 +25,8 @@ test("GET /api/v1/auth/me returns only an active, authenticated customer", { ski
     app.inject({ method: "GET", url: "/api/v1/auth/me", headers: authorization ? { authorization } : {} });
 
   try {
-    const registered = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Me Customer", email, password } });
+    const registered = await registerWithCode(app, { name: "Me Customer", email, password });
+    await app.prisma.emailOtp.deleteMany({ where: { email } });
     assert.equal(registered.statusCode, 201);
     createdUserIds.push(registered.json().data.id);
     const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", payload: { email, password } });

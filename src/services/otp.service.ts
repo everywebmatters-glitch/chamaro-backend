@@ -31,8 +31,10 @@ export function createOtpService(prisma: PrismaClient) {
   return {
     // Generates, hashes, stores, and emails a new OTP, invalidating any previously active code
     // for the same email+purpose first. Enforces the resend cooldown against the most recently
-    // issued code (consumed or not). Never returns or logs the plaintext code.
-    async sendOtp(params: { email: string; purpose: OtpPurpose; userId?: string }): Promise<void> {
+    // issued code (consumed or not). Never returns or logs the plaintext code. `deliver` replaces the
+    // code email for callers that must record a send (same cooldown, same timing) without revealing
+    // the code, e.g. sign-up for an email that already has an account.
+    async sendOtp(params: { email: string; purpose: OtpPurpose; userId?: string; deliver?: () => Promise<void> }): Promise<void> {
       const email = params.email.trim().toLowerCase();
       const latest = await repository.findLatest(email, params.purpose);
       if (latest) {
@@ -46,7 +48,7 @@ export function createOtpService(prisma: PrismaClient) {
       const expiresAt = new Date(Date.now() + env.OTP_EXPIRY_MINUTES * 60_000);
       await repository.invalidateActive(email, params.purpose);
       await repository.create({ email, purpose: params.purpose, otpHash, expiresAt, userId: params.userId });
-      await sendOtpEmail(email, otp, params.purpose);
+      await (params.deliver ? params.deliver() : sendOtpEmail(email, otp, params.purpose));
     },
 
     // Validates `otp` against the latest active (unconsumed) code for email+purpose. On

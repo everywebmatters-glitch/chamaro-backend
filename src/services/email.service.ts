@@ -107,6 +107,20 @@ export async function sendPasswordResetLinkEmail(to: string, resetUrl: string, e
   await send(to, "Reset your Chamaro password", passwordResetEmailHtml(resetUrl, expiryMinutes));
 }
 
+// ---- sign-up for an email that already has an account ---------------------------------------------------------------
+
+// Sent in place of a sign-up code, so the sign-up form answers the same way whether or not the email is registered.
+export function accountExistsEmailHtml(loginUrl: string, resetUrl: string): string {
+  return layout(`<p style="${TEXT}">Someone tried to create a Chamaro account with this email address, but you already have one.</p>
+      <a href="${escapeHtml(loginUrl)}" style="display:inline-block;background:#1f1b16;color:#ffffff;text-decoration:none;font-size:15px;font-weight:700;border-radius:8px;padding:12px 24px;margin:0 0 16px;">Log in</a>
+      <p style="${MUTED}">Forgot your password? <a href="${escapeHtml(resetUrl)}" style="color:#1f1b16;">Reset it here</a>.</p>
+      <p style="${LAST}">If this wasn't you, you can ignore this email; nothing about your account has changed.</p>`);
+}
+
+export async function sendAccountExistsEmail(to: string, loginUrl: string, resetUrl: string): Promise<void> {
+  await send(to, "You already have a Chamaro account", accountExistsEmailHtml(loginUrl, resetUrl), "Failed to send verification email");
+}
+
 // ---- orders ------------------------------------------------------------------------------------------------------
 
 export type OrderEmailItem = { productName: string | null; variantName: string | null; quantity: number; lineTotal: string };

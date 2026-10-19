@@ -15,6 +15,7 @@ import {
   forgotPasswordResetRouteSchema,
   forgotPasswordSendOtpRouteSchema,
   forgotPasswordVerifyOtpRouteSchema,
+  registerSendOtpRouteSchema,
   resetPasswordWithTokenRouteSchema,
   sendLoginOtpRouteSchema,
   verifyLoginOtpRouteSchema,
@@ -37,6 +38,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   app.get("/api/v1/auth/google/callback", { schema: googleCallbackRouteSchema }, (request, reply) => controller.googleCallback(request, reply));
   app.post("/api/v1/auth/google/exchange", { ...authRateLimit, schema: googleExchangeRouteSchema }, (request, reply) => controller.googleExchange(request, reply));
 
+  // Sign-up is two steps: send-otp emails a code, register creates the account only with that code.
+  app.post("/api/v1/auth/register/send-otp", { ...otpRateLimit, schema: registerSendOtpRouteSchema }, (request) => controller.registerSendOtp(request));
   app.post("/api/v1/auth/register", { ...registerRateLimit, schema: registerRouteSchema }, (request, reply) => controller.register(request, reply));
   app.post("/api/v1/auth/login", { ...authRateLimit, schema: loginRouteSchema }, (request, reply) => controller.login(request, reply));
   app.post("/api/v1/auth/admin/login", { ...authRateLimit, schema: adminLoginRouteSchema }, (request, reply) => controller.adminLogin(request, reply));

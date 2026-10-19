@@ -108,3 +108,17 @@ test("the OTP email keeps its subject and code", async () => {
   assert.ok(sent[0].html.includes(">042137</div>"));
   email.setEmailClientForTests(undefined);
 });
+
+test("the account-exists email links to log in and reset, escapes them, and carries no code", async () => {
+  const html = email.accountExistsEmailHtml("https://chamaro.com/account/login", "https://chamaro.com/account/login?reset=1&x=\"><script>");
+  assert.ok(html.includes('href="https://chamaro.com/account/login"'));
+  assert.ok(html.includes("reset=1&amp;x=&quot;&gt;&lt;script&gt;"));
+  assert.ok(!html.includes("<script>"));
+  assert.doesNotMatch(html, /\d{6}/);
+
+  const sent = fakeClient();
+  await email.sendAccountExistsEmail("a@example.test", "https://chamaro.com/account/login", "https://chamaro.com/account/login?reset=1");
+  assert.equal(sent[0].subject, "You already have a Chamaro account");
+  assert.equal(sent[0].to, "a@example.test");
+  email.setEmailClientForTests(undefined);
+});
