@@ -81,6 +81,26 @@ test("a provider error or exception becomes EMAIL_SEND_FAILED without the provid
   email.setEmailClientForTests(undefined);
 });
 
+test("a failed send records only the provider's error name and status, never its message", async () => {
+  // The shape Resend returns for a sender on an unverified domain (e.g. a gmail.com address).
+  fakeClient(async () => ({ error: { name: "validation_error", statusCode: 403, message: "The gmail.com domain is not verified. token=secret 123456" } }));
+  await assert.rejects(email.sendPasswordResetLinkEmail("a@example.test", "https://chamaro.com/reset-password#token=secret", 30), (error: Error & { code?: string; provider?: unknown }) => {
+    assert.equal(error.code, "EMAIL_SEND_FAILED");
+    assert.deepEqual(error.provider, { name: "validation_error", statusCode: 403 });
+    const logged = JSON.stringify({ message: error.message, provider: error.provider });
+    for (const leak of ["gmail", "secret", "123456", "not verified"]) assert.ok(!logged.includes(leak), leak);
+    return true;
+  });
+
+  // Anything that is not a plain error name is replaced, so a hostile or odd payload can't smuggle text into logs.
+  fakeClient(async () => ({ error: { name: "token=secret 123456", statusCode: "403" } }));
+  await assert.rejects(email.sendOtpEmail("a@example.test", "123456", "LOGIN"), { provider: { name: "unknown_error", statusCode: null } });
+
+  fakeClient(async () => { throw new Error("socket hang up: token=secret"); });
+  await assert.rejects(email.sendOtpEmail("a@example.test", "123456", "LOGIN"), { provider: { name: "request_failed", statusCode: null } });
+  email.setEmailClientForTests(undefined);
+});
+
 test("the OTP email keeps its subject and code", async () => {
   const sent = fakeClient();
   await email.sendOtpEmail("a@example.test", "042137", "FORGOT_PASSWORD");

@@ -72,9 +72,11 @@ function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddress">) {
 }
 
 export function createOrderService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
-  // Only the error code is logged: the provider's error can echo the message, which holds the customer's address.
+  // Only the error code and the provider's error name/status are logged: the provider's message can echo the email,
+  // which holds the customer's address.
   function logEmailFailure(error: unknown, orderId: string, message: string) {
-    options.log?.error({ err: { code: (error as { code?: unknown }).code }, orderId }, message);
+    const { code, provider } = error as { code?: unknown; provider?: unknown };
+    options.log?.error({ err: { code, provider }, orderId }, message);
   }
 
   async function sendConfirmation(userId: string, order: PresentedOrder) {

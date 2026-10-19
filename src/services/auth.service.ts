@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { FastifyBaseLogger } from "fastify";
 import type { PrismaClient } from "../../generated/prisma/client.js";
 import { env } from "../config/env.js";
@@ -24,6 +25,10 @@ function resetTokenInvalid(): Error {
   return Object.assign(new Error("This reset link is invalid or has expired; request a new one"), { statusCode: 400, code: "RESET_TOKEN_INVALID" });
 }
 
+// Longer than a normal token write plus email send, so a request for a real account takes as long as one for an
+// unknown email.
+const RESET_LINK_MIN_RESPONSE_MS = 1500;
+
 // Reset tokens are 256 random bits, so a fast unsalted SHA-256 is enough to make the stored value useless
 // to anyone who reads the table; it also lets the token be looked up by its hash.
 export function hashResetToken(token: string): string {
@@ -39,6 +44,24 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
   const repository = createAuthRepository(prisma);
   const resetTokens = createPasswordResetRepository(prisma);
   const otpService = createOtpService(prisma);
+
+  async function issuePasswordResetLink(email: string): Promise<void> {
+    const normalized = email.trim().toLowerCase();
+    const user = await repository.findByEmail(normalized);
+    if (!user || !user.isActive || user.role !== "CUSTOMER") return;
+    const latest = await resetTokens.findLatestForUser(user.id);
+    if (latest && Date.now() - latest.createdAt.getTime() < env.OTP_RESEND_COOLDOWN_SECONDS * 1000) return;
+
+    const token = randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + env.PASSWORD_RESET_TOKEN_TTL_MINUTES * 60_000);
+    await resetTokens.issue({ userId: user.id, tokenHash: hashResetToken(token), expiresAt });
+    try {
+      await sendPasswordResetLinkEmail(user.email, passwordResetUrl(token), env.PASSWORD_RESET_TOKEN_TTL_MINUTES);
+    } catch (error) {
+      const { code, provider } = error as { code?: unknown; provider?: unknown };
+      options.log?.error({ err: { code, provider }, userId: user.id }, "Password reset email failed");
+    }
+  }
 
   async function loginWithGoogle(identity: GoogleIdentity) {
     let user = await repository.findByGoogleId(identity.googleId);
@@ -162,21 +185,15 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
 
     // Emails a single-use reset link to an active CUSTOMER account (admins keep the code flow, and their reset
     // must not point at the storefront). Every other case, a send within the resend cooldown, and a failed email
-    // all return the same way, so the caller can't tell whether the email has an account.
+    // all return the same way, so the caller can't tell whether the email has an account. Every answer also takes
+    // at least RESET_LINK_MIN_RESPONSE_MS, so the time spent issuing and emailing a link doesn't give it away either.
     async requestPasswordResetLink(email: string): Promise<void> {
-      const normalized = email.trim().toLowerCase();
-      const user = await repository.findByEmail(normalized);
-      if (!user || !user.isActive || user.role !== "CUSTOMER") return;
-      const latest = await resetTokens.findLatestForUser(user.id);
-      if (latest && Date.now() - latest.createdAt.getTime() < env.OTP_RESEND_COOLDOWN_SECONDS * 1000) return;
-
-      const token = randomBytes(32).toString("base64url");
-      const expiresAt = new Date(Date.now() + env.PASSWORD_RESET_TOKEN_TTL_MINUTES * 60_000);
-      await resetTokens.issue({ userId: user.id, tokenHash: hashResetToken(token), expiresAt });
+      const started = Date.now();
       try {
-        await sendPasswordResetLinkEmail(user.email, passwordResetUrl(token), env.PASSWORD_RESET_TOKEN_TTL_MINUTES);
-      } catch (error) {
-        options.log?.error({ err: { code: (error as { code?: unknown }).code }, userId: user.id }, "Password reset email failed");
+        await issuePasswordResetLink(email);
+      } finally {
+        const remaining = RESET_LINK_MIN_RESPONSE_MS - (Date.now() - started);
+        if (remaining > 0) await sleep(remaining);
       }
     },
 

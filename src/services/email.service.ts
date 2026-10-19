@@ -20,17 +20,31 @@ export function setEmailClientForTests(fake: EmailClient | undefined): void {
   client = fake;
 }
 
+// What a failed send may record about the provider's answer: Resend's fixed error name (e.g. "validation_error",
+// "invalid_from_address", "restricted_api_key") and HTTP status. Never its free-text message.
+export type EmailProviderFailure = { name: string; statusCode: number | null };
+
+function providerFailure(error: unknown): EmailProviderFailure {
+  const { name, statusCode } = (error ?? {}) as { name?: unknown; statusCode?: unknown };
+  return {
+    name: typeof name === "string" && /^[a-z_]{1,64}$/.test(name) ? name : "unknown_error",
+    statusCode: typeof statusCode === "number" ? statusCode : null,
+  };
+}
+
 // Never logs or rethrows the raw provider error: Resend error payloads can echo the request body, which may
-// contain a code, a reset link or a customer's address. Callers only ever see EMAIL_SEND_FAILED.
+// contain a code, a reset link or a customer's address. Callers only ever see EMAIL_SEND_FAILED, plus
+// `provider` (the error name and status, nothing else) so a misconfiguration such as an unverified sender
+// domain can be told apart from an outage in the logs.
 async function send(to: string, subject: string, html: string, failureMessage = "Failed to send email"): Promise<void> {
-  let failed: boolean;
+  let provider: EmailProviderFailure | undefined;
   try {
     const { error } = await emailClient().emails.send({ from: env.RESEND_FROM_EMAIL, to, subject, html });
-    failed = Boolean(error);
+    if (error) provider = providerFailure(error);
   } catch {
-    failed = true;
+    provider = { name: "request_failed", statusCode: null };
   }
-  if (failed) throw Object.assign(new Error(failureMessage), { statusCode: 502, code: "EMAIL_SEND_FAILED" });
+  if (provider) throw Object.assign(new Error(failureMessage), { statusCode: 502, code: "EMAIL_SEND_FAILED", provider });
 }
 
 export function escapeHtml(value: string): string {

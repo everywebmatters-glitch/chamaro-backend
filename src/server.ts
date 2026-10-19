@@ -9,6 +9,17 @@ function diagnostic(event: string, details: Record<string, unknown> = {}): void 
 
 const isSet = (name: string): boolean => Boolean(process.env[name]);
 
+// Resend sends only from a domain verified in the Resend account: a free mailbox (gmail.com, ...) can never be
+// verified, and resend.dev only delivers to the account owner. Reports the kind of sender domain, not the address.
+const FREE_MAILBOX_DOMAINS = new Set(["gmail.com", "googlemail.com", "yahoo.com", "yahoo.in", "outlook.com", "hotmail.com", "live.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com", "zoho.com", "rediffmail.com"]);
+function senderDomainKind(from: string | undefined): string | null {
+  const address = (from?.match(/<([^>]+)>/)?.[1] ?? from ?? "").trim();
+  const domain = address.split("@")[1]?.toLowerCase();
+  if (!domain) return null;
+  if (FREE_MAILBOX_DOMAINS.has(domain)) return "free_mailbox";
+  return domain === "resend.dev" ? "resend_sandbox" : "custom";
+}
+
 diagnostic("environment", {
   PORT_set: process.env.PORT !== undefined,
   PORT_numeric: process.env.PORT === undefined ? null : Number(process.env.PORT),
@@ -22,6 +33,10 @@ diagnostic("environment", {
   GOOGLE_CLIENT_SECRET_set: isSet("GOOGLE_CLIENT_SECRET"),
   GOOGLE_REDIRECT_URI_set: isSet("GOOGLE_REDIRECT_URI"),
   GOOGLE_FRONTEND_CALLBACK_URL_set: isSet("GOOGLE_FRONTEND_CALLBACK_URL"),
+  RESEND_API_KEY_set: isSet("RESEND_API_KEY"),
+  RESEND_FROM_EMAIL_set: isSet("RESEND_FROM_EMAIL"),
+  RESEND_FROM_EMAIL_domain_kind: senderDomainKind(process.env.RESEND_FROM_EMAIL),
+  APP_BASE_URL: process.env.APP_BASE_URL ?? null,
 });
 
 // Startup runs inside main() because Hostinger's launcher loads this entry with require(), which
