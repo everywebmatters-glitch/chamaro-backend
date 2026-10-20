@@ -28,7 +28,7 @@ type Db = PrismaClient | Prisma.TransactionClient;
 
 // InnoDB may pick one of two overlapping transactions as a deadlock victim (Prisma reports P2034). The work is
 // rolled back completely, so running it again is safe (orders are protected by their Idempotency-Key).
-async function retryOnConflict<T>(run: () => Promise<T>, attempts = 4): Promise<T> {
+export async function retryOnConflict<T>(run: () => Promise<T>, attempts = 4): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
       return await run();
@@ -47,8 +47,8 @@ type OrderRow = Prisma.RetailOrderGetPayload<{ include: typeof orderInclude }>;
 // Orders an admin may mark as shipped. COMPLETED and CANCELLED are final; SHIPPED is handled separately.
 const SHIPPABLE_STATUSES = new Set(["PENDING", "CONFIRMED", "PROCESSING"]);
 // Chamaro has no cash on delivery: an order ships only once its payment is PAID, which only a verified payment
-// provider confirmation may set. The fulfilment status (PENDING/CONFIRMED/PROCESSING) never implies payment.
-// No payment provider is integrated yet, so no order can be shipped until one is.
+// provider confirmation may set (services/payment.service.ts, after reading the payment back from Razorpay). The
+// fulfilment status (PENDING/CONFIRMED/PROCESSING) never implies payment.
 
 export function presentOrder<T extends OrderRow>(order: T) {
   const { shippingAddressSnapshot, ...rest } = order;
@@ -66,7 +66,7 @@ export function presentOrder<T extends OrderRow>(order: T) {
 // The fields of a presented order that the customer emails use.
 type PresentedOrder = { id: string; createdAt: Date; subtotal: string; shippingTotal: string; total: string; shippingMethod: string | null; items: { productName: string | null; variantName: string | null; quantity: number; lineTotal: string }[]; shippingAddress: unknown };
 
-function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddress">) {
+export function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddress">) {
   return {
     items: order.items.map((item) => ({ productName: item.productName, variantName: item.variantName, quantity: item.quantity, lineTotal: item.lineTotal })),
     shippingAddress: (order.shippingAddress ?? null) as OrderEmailAddress | null,
@@ -75,9 +75,12 @@ function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddress">) {
 
 // Records one customer email about an order, inside the order's transaction. The recipient is the order's account
 // holder, read in the same transaction; an address they never verified is recorded as skipped, not sent.
-async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: string, orderId: string, event: "placed" | "shipped" | "cancelled", render: (customerName: string) => EmailMessage) {
+// The eventKey ("order:<id>:cancelled") is the same whichever path cancels the order (the customer, or the payment
+// time limit running out), so an order is announced as cancelled once.
+export async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: string, orderId: string, event: "placed" | "confirmed" | "shipped" | "cancelled", render: (customerName: string) => EmailMessage) {
   const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { id: true, name: true, email: true, emailVerifiedAt: true } });
-  const kind: NotificationKind = event === "placed" ? "ORDER_PLACED" : event === "shipped" ? "ORDER_SHIPPED" : "ORDER_CANCELLED";
+  const kinds: Record<typeof event, NotificationKind> = { placed: "ORDER_PLACED", confirmed: "ORDER_CONFIRMED", shipped: "ORDER_SHIPPED", cancelled: "ORDER_CANCELLED" };
+  const kind = kinds[event];
   return enqueueNotification(tx, {
     eventKey: `order:${orderId}:${event}`,
     kind,
@@ -85,6 +88,19 @@ async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: string, o
     orderId,
     message: render(user.name),
   });
+}
+
+// Gives an order's reserved stock back. Call it inside the transaction that moves the order to a state that will
+// never ship (cancelled, expired unpaid, refunded before shipping), with the order row locked.
+export async function releaseReservation(tx: Prisma.TransactionClient, items: { productId: string; quantity: number }[]) {
+  const released = unitsPerProduct(items);
+  const productIds = [...released.keys()].sort();
+  if (productIds.length === 0) return;
+  await tx.$queryRaw`SELECT id FROM Product WHERE id IN (${Prisma.join(productIds)}) ORDER BY id FOR SHARE`;
+  for (const productId of productIds) {
+    const quantity = released.get(productId)!;
+    await tx.$executeRaw`UPDATE Inventory SET reservedQuantity = GREATEST(reservedQuantity - ${quantity}, 0), updatedAt = NOW(3) WHERE productId = ${productId}`;
+  }
 }
 
 export function createOrderService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
@@ -284,7 +300,9 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
     },
 
     // An unpaid order that is still PENDING can be cancelled by its customer; its stock reservation is released.
-    // The customer is emailed once, by the request that actually cancelled it.
+    // The customer is emailed once, by the request that actually cancelled it. Not while money for it has reached
+    // Razorpay (a payment AUTHORIZED or further, not yet applied to the order): cancelling then would strand the
+    // money on a cancelled order. The payment lock order (order row first) matches payment.service.
     async cancelOrder(userId: string, orderId: string) {
       const customer = await customerFor(userId);
       const result = await retryOnConflict(() => prisma.$transaction(async (tx) => {
@@ -293,14 +311,10 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: orderInclude });
         if (order.status === "CANCELLED") return { order: presentOrder(order), notification: null };
         if (order.status !== "PENDING" || order.paymentStatus !== "UNPAID") throw httpError(409, "ORDER_NOT_CANCELLABLE", "This order can no longer be cancelled here");
+        const moneyMoving = await tx.payment.count({ where: { orderId, status: { notIn: ["CREATED", "FAILED"] } } });
+        if (moneyMoving > 0) throw httpError(409, "PAYMENT_IN_PROGRESS", "A payment for this order has been received and is being confirmed");
 
-        const released = unitsPerProduct(order.items);
-        const productIds = [...released.keys()].sort();
-        await tx.$queryRaw`SELECT id FROM Product WHERE id IN (${Prisma.join(productIds)}) ORDER BY id FOR SHARE`;
-        for (const productId of productIds) {
-          const quantity = released.get(productId)!;
-          await tx.$executeRaw`UPDATE Inventory SET reservedQuantity = GREATEST(reservedQuantity - ${quantity}, 0), updatedAt = NOW(3) WHERE productId = ${productId}`;
-        }
+        await releaseReservation(tx, order.items);
         const cancelled = presentOrder(await tx.retailOrder.update({ where: { id: orderId }, data: { status: "CANCELLED" }, include: orderInclude }));
         const notification = await enqueueOrderEmail(tx, userId, orderId, "cancelled", (customerName) =>
           orderCancelledEmail({ id: cancelled.id, customerName, items: emailParts(cancelled).items, total: cancelled.total, cancelledAt: cancelled.updatedAt }),

@@ -13,6 +13,7 @@ socket, so `DATABASE_URL` has the form
 | `deploy/cloudrun/cloudbuild.yaml` | Builds both images for one commit, checks their contents, smoke-tests the API image, pushes both. |
 | `deploy/cloudrun/service.yaml` | Record of the live `chamaro-api` configuration. Not applied directly (see below). |
 | `deploy/cloudrun/migrate-job.yaml` | Cloud Run job `chamaro-migrate` that runs `prisma migrate deploy`. |
+| `deploy/cloudrun/payment-worker-job.yaml` | Cloud Run job `chamaro-payment-worker`: reconciles Razorpay payments and expires unpaid orders. |
 | `deploy/cloudrun/email-outbox-job.yaml` | Cloud Run job `chamaro-email-outbox`: retries the email outbox (API image, one pass, then exit). |
 
 Images live in `asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images`
@@ -98,6 +99,49 @@ What the rows mean: `SENT` (the provider accepted it), `PENDING` (waiting for a 
 `lastErrorName`), `FAILED` (given up: a provider error name, `outcome_unknown` or `retry_window_expired`),
 `SKIPPED` (`UNVERIFIED_RECIPIENT`: the account never proved it reads that address; nothing was sent).
 To pause sending, pause the scheduler job; requests still record rows, and the first attempt still happens in the API.
+
+## Razorpay payments
+
+Customers pay for a placed order with Razorpay Checkout (`POST /api/v1/orders/:id/payment`, then
+`POST /api/v1/orders/:id/payment/verify` with Checkout's callback). Nothing the browser or a webhook body says is taken
+as payment state: signatures are checked, then the payment is read back from Razorpay's API, and only an amount and
+currency matching the order's stored total marks it PAID (see `src/services/payment.service.ts`). Without the
+Razorpay settings below, payment answers 503 `PAYMENTS_NOT_CONFIGURED` and nothing else changes.
+
+Secrets (Secret Manager, readable by `chamaro-backend`), set by a person from the Razorpay dashboard, never in Git:
+
+| Secret | Value |
+| --- | --- |
+| `RAZORPAY_KEY_ID` | API key id, `rzp_test_...` while testing |
+| `RAZORPAY_KEY_SECRET` | that key's secret |
+| `RAZORPAY_WEBHOOK_SECRET` | the secret typed into the webhook below (not the API secret) |
+
+Live keys (`rzp_live_...`) are refused unless the plain setting `RAZORPAY_ALLOW_LIVE_KEYS=true` is also set, so going
+live is a deliberate, separate step. Optional: `ORDER_PAYMENT_TTL_MINUTES` (15-1440, default 60).
+
+Webhook (Razorpay dashboard > Settings > Webhooks), URL `https://api.chamaro.com/api/v1/payments/razorpay/webhook`,
+events `payment.authorized`, `payment.captured`, `payment.failed`, `order.paid`, `refund.processed`.
+
+One-time setup, after the secrets exist:
+
+```sh
+gcloud run deploy chamaro-api --project $P --region $R --image $REPO/chamaro-api:$TAG --no-traffic --tag c$TAG \
+  --update-secrets RAZORPAY_KEY_ID=RAZORPAY_KEY_ID:latest,RAZORPAY_KEY_SECRET=RAZORPAY_KEY_SECRET:latest,RAZORPAY_WEBHOOK_SECRET=RAZORPAY_WEBHOOK_SECRET:latest
+sed "s/<TAG>/$TAG/" deploy/cloudrun/payment-worker-job.yaml > /tmp/payment-worker-job.yaml
+gcloud run jobs replace /tmp/payment-worker-job.yaml --project $P --region $R
+gcloud run jobs add-iam-policy-binding chamaro-payment-worker --project $P --region $R \
+  --member serviceAccount:chamaro-outbox-scheduler@$P.iam.gserviceaccount.com --role roles/run.invoker
+gcloud scheduler jobs create http chamaro-payment-worker-every-5-min --project $P --location $R \
+  --schedule "*/5 * * * *" --time-zone Asia/Kolkata --http-method POST \
+  --uri https://run.googleapis.com/v2/projects/$P/locations/$R/jobs/chamaro-payment-worker:run \
+  --oauth-service-account-email chamaro-outbox-scheduler@$P.iam.gserviceaccount.com
+```
+
+Each release then also runs `gcloud run jobs replace` for `payment-worker-job.yaml` with the new tag, like step 6.
+
+Money that needs a person (a second payment, a wrong amount, money for a cancelled order, a refund after dispatch) is
+never applied to an order; it is listed by `GET /api/v1/admin/payments?needsReview=true` and is refunded from the
+Razorpay dashboard. Uncaptured (authorized-only) payments are returned to the customer by Razorpay itself.
 
 ## Notes
 

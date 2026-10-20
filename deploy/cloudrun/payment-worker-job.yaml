@@ -1,0 +1,76 @@
+# Cloud Run job that keeps payments honest when a browser callback or a webhook is lost: one pass of
+# src/scripts/payment-worker.ts, then exit. It reads back from Razorpay the gateway orders whose outcome this system has
+# not seen, applies refunds made in the Razorpay dashboard, and cancels orders left unpaid past
+# ORDER_PAYMENT_TTL_MINUTES (default 60) after checking Razorpay first. Same image, service account, Cloud SQL connection
+# and secret references as the chamaro-api service. Create or update it with
+#   sed "s/<TAG>/$TAG/" deploy/cloudrun/payment-worker-job.yaml > /tmp/payment-worker-job.yaml
+#   gcloud run jobs replace /tmp/payment-worker-job.yaml --region asia-south1
+# Cloud Scheduler (chamaro-payment-worker-every-5-min, see README.md) starts it every five minutes.
+#
+# Overlapping executions are safe: every change locks the order row, and payment states only move forward.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: chamaro-payment-worker
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+          maxRetries: 0
+          timeoutSeconds: 300
+          containers:
+            - name: payment-worker
+              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-api:<TAG>
+              command: ["node"]
+              args: ["dist/src/scripts/payment-worker.js"]
+              env:
+                # The image sets APP_ENV=production, so config/env.ts requires CORS_ORIGIN at startup.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: DATABASE_URL
+                      key: latest
+                - name: CORS_ORIGIN
+                  valueFrom:
+                    secretKeyRef:
+                      name: CORS_ORIGIN
+                      key: latest
+                - name: RAZORPAY_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: RAZORPAY_KEY_ID
+                      key: latest
+                - name: RAZORPAY_KEY_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: RAZORPAY_KEY_SECRET
+                      key: latest
+                - name: RAZORPAY_WEBHOOK_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: RAZORPAY_WEBHOOK_SECRET
+                      key: latest
+                # Order-confirmed and expiry-cancellation emails are queued by this job and sent through the outbox.
+                - name: RESEND_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: RESEND_API_KEY
+                      key: latest
+                - name: RESEND_FROM_EMAIL
+                  valueFrom:
+                    secretKeyRef:
+                      name: RESEND_FROM_EMAIL_DOMAIN
+                      key: "1"
+                - name: APP_BASE_URL
+                  value: https://chamaro.com
+              resources:
+                limits:
+                  cpu: 1000m
+                  memory: 512Mi

@@ -393,6 +393,7 @@ model RetailOrder {
   shippingAddress         RetailAddress?      @relation(fields: [shippingAddressId], references: [id], onDelete: Restrict)
   items                   RetailOrderItem[]
   emailNotifications      EmailNotification[]
+  payments                Payment[]
   createdAt               DateTime            @default(now())
   updatedAt               DateTime            @updatedAt
 
@@ -400,6 +401,67 @@ model RetailOrder {
   @@index([customerId, createdAt])
   @@index([status, createdAt])
   @@index([shippingAddressId])
+}
+
+// One row per gateway order (a Razorpay "order_..."): an attempt to pay one RetailOrder. Its state is only ever
+// copied from the gateway's API (never from a browser or a webhook body), and only moves forward:
+// CREATED/FAILED -> AUTHORIZED -> CAPTURED -> PARTIALLY_REFUNDED -> REFUNDED. FAILED means the latest try failed; the
+// customer may still pay this same gateway order. No card, UPI or bank details are stored: only the gateway's ids,
+// the amount, the method name and the gateway's fixed error code.
+enum PaymentStatus {
+  CREATED
+  FAILED
+  AUTHORIZED
+  CAPTURED
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+model Payment {
+  id                  String        @id @default(cuid())
+  orderId             String
+  provider            String        @default("RAZORPAY") @db.VarChar(32)
+  providerOrderId     String        @unique @db.VarChar(64)
+  // The gateway payment ("pay_...") that was authorized or captured. NULL until one is.
+  providerPaymentId   String?       @unique @db.VarChar(64)
+  amountMinor         Int
+  currency            String        @default("INR") @db.Char(3)
+  status              PaymentStatus @default(CREATED)
+  amountRefundedMinor Int           @default(0)
+  // "upi", "card", "netbanking", "wallet"... as the gateway reports it.
+  method              String?       @db.VarChar(32)
+  // The gateway's fixed error code and step from the last failed try, never its free-text description.
+  lastErrorCode       String?       @db.VarChar(64)
+  lastErrorReason     String?       @db.VarChar(64)
+  // Set when money moved in a way that needs a person: a payment for an order that was already cancelled or paid,
+  // or an amount that does not match the order. Such a payment never marks the order paid.
+  needsReview         Boolean       @default(false)
+  reviewReason        String?       @db.VarChar(64)
+  authorizedAt        DateTime?
+  capturedAt          DateTime?
+  refundedAt          DateTime?
+  lastSyncedAt        DateTime?
+  order               RetailOrder   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([status, createdAt])
+  @@index([needsReview])
+}
+
+// Webhook deliveries already received, by the gateway's event id, so a redelivered event is processed once. Only ids
+// and the event name are kept; the body (which holds customer contact details) is never stored.
+model PaymentWebhookEvent {
+  id                String    @id @default(cuid())
+  provider          String    @default("RAZORPAY") @db.VarChar(32)
+  eventId           String    @unique @db.VarChar(64)
+  event             String    @db.VarChar(64)
+  providerPaymentId String?   @db.VarChar(64)
+  processedAt       DateTime?
+  attempts          Int       @default(0)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 }
 
 model RetailOrderItem {

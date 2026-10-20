@@ -260,6 +260,31 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
   };
 }
 
+// Sent once the payment has been read back from Razorpay as captured for the full order total.
+export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): EmailMessage {
+  const shippingLabel = `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
+  return {
+    subject: `Chamaro order ${order.id} confirmed: payment received`,
+    html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, we've received your payment and your order is confirmed.</p>
+      <p style="${TEXT}"><strong>Order ${escapeHtml(order.id)}</strong><br><span style="color:#78716c;font-size:13px;">Paid ${formatIstDate(order.paidAt)}</span></p>
+      ${table(`${itemRows(order.items)}
+        ${row("Subtotal", rupees(order.subtotal))}
+        ${row(escapeHtml(shippingLabel), rupees(order.shippingTotal))}
+        ${row("Total paid", rupees(order.total), TOTAL_CELL)}`)}
+      ${addressBlock(order.shippingAddress)}
+      <p style="${MUTED}">We'll email you again when your order ships.</p>
+      <p style="${LAST}">Questions about your order? Contact us at ${contactHtml()} and quote your order reference.</p>`),
+    text: textLayout([
+      `Hi ${order.customerName}, we've received your payment and your order is confirmed.`,
+      `Order ${order.id}\nPaid ${formatIstDate(order.paidAt)}`,
+      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal paid: ${rupeesText(order.total)}`,
+      addressText(order.shippingAddress),
+      "We'll email you again when your order ships.",
+      `Questions about your order? Contact us at ${contactUrl()} and quote your order reference.`,
+    ]),
+  };
+}
+
 export function shipmentEmail(shipment: ShipmentEmail): EmailMessage {
   return {
     subject: `Your Chamaro order ${shipment.id} has shipped`,
@@ -282,20 +307,24 @@ export function shipmentEmail(shipment: ShipmentEmail): EmailMessage {
   };
 }
 
-// Only unpaid orders can be cancelled (see order.service cancelOrder), so no payment was taken for them.
-export function orderCancelledEmail(order: CancellationEmail): EmailMessage {
+// Only unpaid orders are cancelled this way (by the customer, see order.service cancelOrder, or because payment was
+// not completed in time, `reason: "payment_expired"`), so no payment was taken for them.
+export function orderCancelledEmail(order: CancellationEmail & { reason?: "customer" | "payment_expired" }): EmailMessage {
+  const expired = order.reason === "payment_expired";
+  const why = expired ? " because payment was not completed in time" : "";
+  const footer = expired ? "Still want these items? Place a new order on our website." : "Didn't cancel this order?";
   return {
     subject: `Your Chamaro order ${order.id} has been cancelled`,
-    html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, your order ${escapeHtml(order.id)} was cancelled on ${formatIstDate(order.cancelledAt)}.</p>
+    html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, your order ${escapeHtml(order.id)} was cancelled on ${formatIstDate(order.cancelledAt)}${why}.</p>
       <p style="${TEXT}">No payment was taken for this order.</p>
       ${table(`${itemRows(order.items)}
         ${row("Order total", rupees(order.total), TOTAL_CELL)}`)}
-      <p style="${LAST}">Didn't cancel this order? Contact us at ${contactHtml()} and quote your order reference.</p>`),
+      <p style="${LAST}">${footer} Contact us at ${contactHtml()} and quote your order reference.</p>`),
     text: textLayout([
-      `Hi ${order.customerName}, your order ${order.id} was cancelled on ${formatIstDate(order.cancelledAt)}.`,
+      `Hi ${order.customerName}, your order ${order.id} was cancelled on ${formatIstDate(order.cancelledAt)}${why}.`,
       "No payment was taken for this order.",
       `${itemLines(order.items)}\nOrder total: ${rupeesText(order.total)}`,
-      `Didn't cancel this order? Contact us at ${contactUrl()} and quote your order reference.`,
+      `${footer} Contact us at ${contactUrl()} and quote your order reference.`,
     ]),
   };
 }
