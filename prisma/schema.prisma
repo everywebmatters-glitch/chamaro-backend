@@ -258,6 +258,7 @@ model CmsSection {
 model Banner {
   id             String       @id @default(cuid())
   title          String
+  subtitle       String?      @db.VarChar(500)
   imageUrl       String       @db.VarChar(2048)
   mobileImageUrl String?      @db.VarChar(2048)
   linkUrl        String?      @db.VarChar(2048)

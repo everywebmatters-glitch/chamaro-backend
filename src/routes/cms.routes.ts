@@ -4,7 +4,7 @@ const pageBody = { type: "object", additionalProperties: false, required: ["titl
 // Banner links and images are rendered by the storefront, so only web URLs are accepted:
 // javascript:, data:, file: and other schemes are rejected. 2048 matches the database columns.
 const webUrl = { type: "string", format: "uri", pattern: "^[Hh][Tt][Tt][Pp][Ss]?://", maxLength: 2048 };
-const bannerBody = { type: "object", additionalProperties: false, required: ["title", "imageUrl"], properties: { title: { type: "string", minLength: 1, maxLength: 191 }, imageUrl: webUrl, mobileImageUrl: webUrl, linkUrl: webUrl, altText: { type: "string", maxLength: 500 }, status: { type: "string", enum: ["DRAFT", "ACTIVE", "ARCHIVED"] }, position: { type: "integer", minimum: 0 }, pageId: { type: "string" }, startAt: { type: "string", format: "date-time" }, endAt: { type: "string", format: "date-time" } } };
+const bannerBody = { type: "object", additionalProperties: false, required: ["title", "imageUrl"], properties: { title: { type: "string", minLength: 1, maxLength: 191 }, subtitle: { type: "string", maxLength: 500 }, imageUrl: webUrl, mobileImageUrl: webUrl, linkUrl: webUrl, altText: { type: "string", maxLength: 500 }, status: { type: "string", enum: ["DRAFT", "ACTIVE", "ARCHIVED"] }, position: { type: "integer", minimum: 0 }, pageId: { type: "string" }, startAt: { type: "string", format: "date-time" }, endAt: { type: "string", format: "date-time" } } };
 const pageInclude = { sections: { orderBy: { position: "asc" as const } }, banners: { where: { status: "ACTIVE" as const }, orderBy: { position: "asc" as const } } };
 function pageData(input: any) { const { sections, ...data } = input; return { ...data, ...(sections ? { sections: { create: sections } } : {}) }; }
 
