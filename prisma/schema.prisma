@@ -421,6 +421,9 @@ model Payment {
   id                  String        @id @default(cuid())
   orderId             String
   provider            String        @default("RAZORPAY") @db.VarChar(32)
+  // "test" or "live": the Razorpay key mode the gateway order was created with. A test-mode payment moves no real
+  // money, so an order paid that way is never shipped, and a gateway order is only ever read back with keys of its mode.
+  mode                String        @db.VarChar(4)
   providerOrderId     String        @unique @db.VarChar(64)
   // The gateway payment ("pay_...") that was authorized or captured. NULL until one is.
   providerPaymentId   String?       @unique @db.VarChar(64)
@@ -448,6 +451,7 @@ model Payment {
   @@index([orderId])
   @@index([status, createdAt])
   @@index([needsReview])
+  @@index([mode, status])
 }
 
 // Webhook deliveries already received, by the gateway's event id, so a redelivered event is processed once. Only ids

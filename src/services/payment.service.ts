@@ -38,6 +38,8 @@ import { emailParts, enqueueOrderEmail, presentOrder, releaseReservation, retryO
 //    per order, so it is sent once;
 //  - a refund counts only once Razorpay reports it "processed" (read from the payment's refund list): a requested,
 //    pending or failed refund never marks a payment or an order refunded;
+//  - every payment records the key mode ("test"/"live") it was created with. Only gateway orders of the current mode are
+//    reused, confirmed or read back, and an order paid in test mode is never shipped (orderPaidLive);
 //  - an order can be paid for ORDER_PAYMENT_TTL_MINUTES after it is placed (Checkout is told how long is left), and is
 //    expired only EXPIRY_GRACE_MS after that, once Razorpay has been asked again, so a payment finishing late is seen first.
 
@@ -67,10 +69,21 @@ function nextStatus(current: PaymentStatus, remote: RemotePayment): PaymentStatu
   return RANK[target] > RANK[current] ? target : current;
 }
 
+// Whether an order's payment is real money: PAID by a non-flagged, captured LIVE payment. Every dispatch path (manual
+// shipping, Delhivery) must check this as well as paymentStatus, so a sandbox test order is never shipped.
+export async function orderPaidLive(db: PrismaClient | Prisma.TransactionClient, orderId: string): Promise<boolean> {
+  const order = await db.retailOrder.findUnique({ where: { id: orderId }, select: { paymentStatus: true } });
+  if (order?.paymentStatus !== "PAID") return false;
+  const live = await db.payment.count({ where: { orderId, mode: "live", needsReview: false, status: { in: ["CAPTURED", "PARTIALLY_REFUNDED"] } } });
+  return live > 0;
+}
+
 export function createPaymentService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
   const outbox = createEmailOutbox(prisma, { log: options.log });
   const checkout = createCheckoutService(prisma);
   const client = (): RazorpayClient => razorpayClientFor(readRazorpayConfig());
+  // The key mode payments are created and read back with now; only payments of this mode are touched.
+  const currentMode = () => readRazorpayConfig().mode;
 
   const ttlMs = () => env.ORDER_PAYMENT_TTL_MINUTES * 60_000;
 
@@ -91,7 +104,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
 
   async function apply(remote: RemotePayment): Promise<Applied> {
     if (!remote.orderId) return { outcome: "ignored", orderId: null, capture: null, notification: null };
-    const known = await prisma.payment.findUnique({ where: { providerOrderId: remote.orderId }, select: { orderId: true } });
+    const known = await prisma.payment.findFirst({ where: { providerOrderId: remote.orderId, mode: currentMode() }, select: { orderId: true } });
     if (!known) {
       // Not a gateway order this system created (another integration, or a test event).
       options.log?.warn({ providerOrderId: remote.orderId, providerPaymentId: remote.id }, "Payment for an unknown gateway order ignored");
@@ -251,7 +264,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
         if (order.createdAt.getTime() + ttlMs() <= Date.now()) throw httpError(409, "ORDER_PAYMENT_EXPIRED", "The time to pay for this order has run out; please place it again");
         if (order.payments.some((payment) => RANK[payment.status] > 0)) throw httpError(409, "PAYMENT_IN_PROGRESS", "A payment for this order has been received and is being confirmed");
         const totalMinor = toMinor(order.total);
-        const open = order.payments.find((payment) => OPEN_STATUSES.includes(payment.status) && payment.amountMinor === totalMinor && !payment.needsReview) ?? null;
+        const open = order.payments.find((payment) => payment.mode === config.mode && OPEN_STATUSES.includes(payment.status) && payment.amountMinor === totalMinor && !payment.needsReview) ?? null;
         return { totalMinor, open, payableUntil: new Date(order.createdAt.getTime() + ttlMs()) };
       };
 
@@ -266,7 +279,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
         const again = await payable(tx);
         // Another request opened one meanwhile: use it (the gateway order just created is never shown, so never paid).
         if (again.open) return again.open;
-        return tx.payment.create({ data: { orderId, providerOrderId: remote.id, amountMinor: again.totalMinor, currency: "INR" } });
+        return tx.payment.create({ data: { orderId, mode: config.mode, providerOrderId: remote.id, amountMinor: again.totalMinor, currency: "INR" } });
       }));
       options.log?.info({ paymentId: payment.id, orderId }, "Payment opened");
       return checkoutResponse(config, payment, orderId, first.payableUntil);
@@ -277,7 +290,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     async confirmFromCheckout(userId: string, orderId: string, body: { razorpayOrderId: string; razorpayPaymentId: string; razorpaySignature: string }) {
       const config = readRazorpayConfig();
       if (!ORDER_ID.test(body.razorpayOrderId) || !PAYMENT_ID.test(body.razorpayPaymentId)) throw httpError(400, "PAYMENT_SIGNATURE_INVALID", "This payment could not be verified");
-      const payment = await prisma.payment.findFirst({ where: { providerOrderId: body.razorpayOrderId, orderId, order: { customer: { userId } } }, select: { id: true, providerOrderId: true } });
+      const payment = await prisma.payment.findFirst({ where: { providerOrderId: body.razorpayOrderId, orderId, mode: config.mode, order: { customer: { userId } } }, select: { id: true, providerOrderId: true } });
       if (!payment) throw httpError(404, "NOT_FOUND", "Payment not found");
       // As Razorpay documents: the signature is checked against the gateway order id this server created and stored.
       if (!checkoutSignatureValid(payment.providerOrderId, body.razorpayPaymentId, body.razorpaySignature, config.keySecret)) {
@@ -330,7 +343,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
       if (relevant && (paymentId || providerOrderId)) {
         const gateway = client();
         if (paymentId) outcomes = [(await settle(gateway, await gateway.fetchPayment(paymentId))).outcome];
-        else if (providerOrderId && (await prisma.payment.count({ where: { providerOrderId } })) > 0) outcomes = await syncGatewayOrder(gateway, providerOrderId);
+        else if (providerOrderId && (await prisma.payment.count({ where: { providerOrderId, mode: currentMode() } })) > 0) outcomes = await syncGatewayOrder(gateway, providerOrderId);
       }
       await prisma.paymentWebhookEvent.update({ where: { id: row.id }, data: { processedAt: new Date() } });
       options.log?.info({ eventId, event, outcomes }, "Payment webhook processed");
@@ -343,8 +356,10 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     // webhook), and recent captured payments for refunds made in the Razorpay dashboard.
     async reconcile(limit = 25) {
       const now = Date.now();
+      const mode = currentMode();
       const rows = await prisma.payment.findMany({
         where: {
+          mode,
           OR: [
             { status: { in: ["CREATED", "FAILED", "AUTHORIZED"] }, createdAt: { lt: new Date(now - 2 * 60_000), gt: new Date(now - 3 * 24 * 60 * 60_000) }, OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: new Date(now - 5 * 60_000) } }] },
             { status: { in: ["CAPTURED", "PARTIALLY_REFUNDED"] }, capturedAt: { gt: new Date(now - 30 * 24 * 60 * 60_000) }, OR: [{ lastSyncedAt: null }, { lastSyncedAt: { lt: new Date(now - 6 * 60 * 60_000) } }] },
@@ -374,20 +389,30 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     // never cancelled here.
     async expireUnpaidOrders(limit = 25) {
       const cutoff = new Date(Date.now() - ttlMs() - EXPIRY_GRACE_MS);
-      const due = await prisma.retailOrder.findMany({ where: { status: "PENDING", paymentStatus: "UNPAID", createdAt: { lt: cutoff } }, orderBy: { createdAt: "asc" }, take: limit, select: { id: true, payments: { select: { providerOrderId: true } } } });
+      const mode = currentMode();
+      const due = await prisma.retailOrder.findMany({ where: { status: "PENDING", paymentStatus: "UNPAID", createdAt: { lt: cutoff } }, orderBy: { createdAt: "asc" }, take: limit, select: { id: true, payments: { select: { providerOrderId: true, mode: true } } } });
       const tally = { due: due.length, expired: 0, kept: 0, errors: 0 };
       let gateway: RazorpayClient | null = null;
       for (const candidate of due) {
         try {
           if (candidate.payments.length > 0) {
             gateway ??= client();
-            for (const payment of candidate.payments) await syncGatewayOrder(gateway, payment.providerOrderId);
+            for (const payment of candidate.payments) {
+              // Created under the other key mode: it can't be read back with these keys. A test-mode gateway order
+              // moves no real money, so it doesn't block expiry; an unreadable live one does (left for a person).
+              if (payment.mode !== mode) {
+                if (payment.mode === "live") throw Object.assign(new Error("Live gateway order can't be checked with test keys"), { code: "PAYMENT_MODE_MISMATCH" });
+                continue;
+              }
+              await syncGatewayOrder(gateway, payment.providerOrderId);
+            }
           }
           const notification = await retryOnConflict(() => prisma.$transaction(async (tx) => {
             if (!(await lockOrder(tx, candidate.id))) return null;
-            const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: candidate.id }, include: { ...orderWithItems, payments: { select: { status: true } } } });
+            const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: candidate.id }, include: { ...orderWithItems, payments: { select: { status: true, mode: true } } } });
             if (order.status !== "PENDING" || order.paymentStatus !== "UNPAID" || order.createdAt >= cutoff) return null;
-            if (order.payments.some((payment) => RANK[payment.status] > 0)) return null; // money moved: leave it to reconcile/review
+            if (order.payments.some((payment) => RANK[payment.status] > 0 && payment.mode === "live")) return null; // money moved: leave it to reconcile/review
+            if (order.payments.some((payment) => RANK[payment.status] > 0 && payment.mode === mode)) return null;
             await releaseReservation(tx, order.items);
             const cancelled = presentOrder(await tx.retailOrder.update({ where: { id: order.id }, data: { status: "CANCELLED" }, include: { items: { orderBy: { id: "asc" } } } }));
             return enqueueOrderEmail(tx, order.customer.userId, order.id, "cancelled", (customerName) =>
@@ -410,10 +435,13 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     // so money that reached Razorpay but not yet this system blocks the cancellation (PAYMENT_IN_PROGRESS) instead of
     // landing on a cancelled order. If Razorpay can't be reached, the cancellation is refused rather than guessed.
     async syncBeforeCustomerCancel(userId: string, orderId: string) {
-      const payments = await prisma.payment.findMany({ where: { orderId, order: { customer: { userId } } }, select: { providerOrderId: true } });
+      const payments = await prisma.payment.findMany({ where: { orderId, order: { customer: { userId } } }, select: { providerOrderId: true, mode: true } });
       if (payments.length === 0) return;
+      // A live gateway order can't be checked with test keys: refuse rather than guess (test ones move no real money).
+      const mode = currentMode();
+      if (payments.some((payment) => payment.mode === "live" && mode !== "live")) throw httpError(409, "PAYMENT_STATUS_UNKNOWN", "This order's payment can't be checked right now; please contact us");
       const gateway = client();
-      for (const payment of payments) await syncGatewayOrder(gateway, payment.providerOrderId).catch(gatewayError);
+      for (const payment of payments) if (payment.mode === mode) await syncGatewayOrder(gateway, payment.providerOrderId).catch(gatewayError);
     },
 
     // ---- admin ------------------------------------------------------------------------------------------------
@@ -429,8 +457,9 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
 
     // Reads one gateway order back from Razorpay now (e.g. after a refund in the dashboard).
     async adminSyncPayment(paymentId: string) {
-      const payment = await prisma.payment.findUnique({ where: { id: paymentId }, select: { providerOrderId: true } });
+      const payment = await prisma.payment.findUnique({ where: { id: paymentId }, select: { providerOrderId: true, mode: true } });
       if (!payment) throw httpError(404, "NOT_FOUND", "Payment not found");
+      if (payment.mode !== currentMode()) throw httpError(409, "PAYMENT_MODE_MISMATCH", `This payment was made with ${payment.mode} keys and can't be read with the current ones`);
       await syncGatewayOrder(client(), payment.providerOrderId).catch(gatewayError);
       return prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
     },

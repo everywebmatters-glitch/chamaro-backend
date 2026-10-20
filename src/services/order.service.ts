@@ -355,6 +355,9 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         }
         if (!SHIPPABLE_STATUSES.has(order.status)) throw httpError(409, "ORDER_NOT_SHIPPABLE", `A ${order.status.toLowerCase()} order can't be marked as shipped`);
         if (order.paymentStatus !== "PAID") throw httpError(409, "ORDER_NOT_PAID", "Only orders with a verified online payment can be shipped");
+        // Same rule as payment.service orderPaidLive: a sandbox (test-mode) payment moves no real money.
+        const livePayments = await tx.payment.count({ where: { orderId, mode: "live", needsReview: false, status: { in: ["CAPTURED", "PARTIALLY_REFUNDED"] } } });
+        if (livePayments === 0) throw httpError(409, "ORDER_PAID_IN_TEST_MODE", "This order was paid with Razorpay test keys; it can't be shipped");
         const shipped = await tx.retailOrder.update({
           where: { id: orderId },
           data: { status: "SHIPPED", carrier: input.carrier, trackingNumber: input.trackingNumber, shippedAt: new Date() },

@@ -16,6 +16,7 @@ CREATE TABLE `Payment` (
     `id` VARCHAR(191) NOT NULL,
     `orderId` VARCHAR(191) NOT NULL,
     `provider` VARCHAR(32) NOT NULL DEFAULT 'RAZORPAY',
+    `mode` VARCHAR(4) NOT NULL,
     `providerOrderId` VARCHAR(64) NOT NULL,
     `providerPaymentId` VARCHAR(64) NULL,
     `amountMinor` INTEGER NOT NULL,
@@ -39,6 +40,7 @@ CREATE TABLE `Payment` (
     INDEX `Payment_orderId_idx`(`orderId`),
     INDEX `Payment_status_createdAt_idx`(`status`, `createdAt`),
     INDEX `Payment_needsReview_idx`(`needsReview`),
+    INDEX `Payment_mode_status_idx`(`mode`, `status`),
     PRIMARY KEY (`id`)
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 

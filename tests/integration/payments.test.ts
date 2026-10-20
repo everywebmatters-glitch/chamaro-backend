@@ -542,10 +542,58 @@ test("only a genuinely paid order can be shipped: unpaid, failed, cancelled, ref
       assert.equal(res.statusCode, 409, `${label}: ${res.body}`);
     }
 
-    const paid = await shop.placedOrder();
-    const paidOpened = await shop.openPayment(paid, paid.order.id);
-    await shop.paymentWebhook("payment.captured", gateway.pay(paidOpened.razorpayOrderId, "captured"));
-    assert.equal((await ship(paid.order.id)).statusCode, 200);
+    // Paid in test mode (sandbox keys): PAID, but no real money moved, so it is never shipped.
+    const sandbox = await shop.placedOrder();
+    const sandboxOpened = await shop.openPayment(sandbox, sandbox.order.id);
+    await shop.paymentWebhook("payment.captured", gateway.pay(sandboxOpened.razorpayOrderId, "captured"));
+    assert.equal((await shop.order(sandbox.order.id)).paymentStatus, "PAID");
+    const sandboxShip = await ship(sandbox.order.id);
+    assert.deepEqual([sandboxShip.statusCode, sandboxShip.json().error.code], [409, "ORDER_PAID_IN_TEST_MODE"]);
+    const { orderPaidLive } = await import("../../src/services/payment.service.js");
+    assert.equal(await orderPaidLive(shop.app.prisma, sandbox.order.id), false);
+
+    // Paid with live keys: shipped.
+    process.env.RAZORPAY_KEY_ID = "rzp_live_ChamaroFake01";
+    process.env.RAZORPAY_ALLOW_LIVE_KEYS = "true";
+    try {
+      const paid = await shop.placedOrder();
+      const paidOpened = await shop.openPayment(paid, paid.order.id);
+      assert.equal(paidOpened.mode, "live");
+      await shop.paymentWebhook("payment.captured", gateway.pay(paidOpened.razorpayOrderId, "captured"));
+      assert.equal(await orderPaidLive(shop.app.prisma, paid.order.id), true);
+      assert.equal((await ship(paid.order.id)).statusCode, 200);
+    } finally {
+      process.env.RAZORPAY_KEY_ID = KEY_ID;
+      delete process.env.RAZORPAY_ALLOW_LIVE_KEYS;
+    }
+  }));
+
+test("after switching to live keys, sandbox payments are never read back, reused or confirmed with them", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { createPaymentService } = await import("../../src/services/payment.service.js");
+    const placed = await shop.placedOrder();
+    const opened = await shop.openPayment(placed, placed.order.id);
+    const testPayment = gateway.pay(opened.razorpayOrderId, "captured");
+    await shop.app.prisma.payment.updateMany({ where: { orderId: placed.order.id }, data: { createdAt: new Date(Date.now() - 10 * 60_000) } });
+
+    process.env.RAZORPAY_KEY_ID = "rzp_live_ChamaroFake01";
+    process.env.RAZORPAY_ALLOW_LIVE_KEYS = "true";
+    try {
+      gateway.calls.length = 0;
+      await createPaymentService(shop.app.prisma).reconcile(500);
+      assert.equal(gateway.calls.filter((call) => call === "fetchOrderPayments").length, 0, "test gateway orders are not read with live keys");
+      const callback = await shop.confirm(placed.headers, placed.order.id, opened.razorpayOrderId, testPayment);
+      assert.equal(callback.statusCode, 404, "a test-mode gateway order can't be confirmed with live keys");
+      await shop.verifyCheckout(placed.user.id);
+      const reopened = await shop.startPayment(placed.headers, placed.order.id);
+      assert.equal(reopened.statusCode, 200, reopened.body);
+      assert.notEqual(reopened.json().data.razorpayOrderId, opened.razorpayOrderId, "a new live gateway order, not the sandbox one");
+      assert.equal(reopened.json().data.mode, "live");
+      assert.equal((await shop.order(placed.order.id)).paymentStatus, "UNPAID");
+    } finally {
+      process.env.RAZORPAY_KEY_ID = KEY_ID;
+      delete process.env.RAZORPAY_ALLOW_LIVE_KEYS;
+    }
   }));
 
 // ---- configuration and secrets ----------------------------------------------------------------------------------------
