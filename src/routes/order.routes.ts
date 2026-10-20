@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { idParams, routeSchema } from "../shared/http.js";
 import { MAX_LINE_QUANTITY, SHIPPING_METHODS } from "../shared/order-pricing.js";
 import { createOrderService } from "../services/order.service.js";
+import { createPaymentService } from "../services/payment.service.js";
 
 const customerQuery = { type: "object", additionalProperties: false, properties: { page: { type: "integer", minimum: 1, default: 1 }, limit: { type: "integer", minimum: 1, maximum: 50, default: 10 } } };
 const adminQuery = {
@@ -63,6 +64,7 @@ const bearer = [{ bearerAuth: [] }];
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = createOrderService(app.prisma, { log: app.log });
+  const payments = createPaymentService(app.prisma, { log: app.log });
   const userId = (request: FastifyRequest) => (request.user as { sub: string }).sub;
 
   // ---- customer cart -----------------------------------------------------------------------------------------
@@ -111,7 +113,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
   app.post("/api/v1/orders/:id/cancel", { schema: routeSchema(["Orders"], "Cancel an unpaid, pending order and release its stock", { security: bearer, params: idParams }) }, async (request) => {
     await request.requireCustomer();
-    return { success: true, data: await service.cancelOrder(userId(request), (request.params as { id: string }).id) };
+    const orderId = (request.params as { id: string }).id;
+    // Razorpay is asked first, so a payment it has but this system hasn't seen yet blocks the cancellation.
+    await payments.syncBeforeCustomerCancel(userId(request), orderId);
+    return { success: true, data: await service.cancelOrder(userId(request), orderId) };
   });
 
   // ---- admin -------------------------------------------------------------------------------------------------

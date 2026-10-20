@@ -35,13 +35,20 @@ import { emailParts, enqueueOrderEmail, presentOrder, releaseReservation, retryO
 //  - an authorized payment is captured only while its order can still be confirmed; otherwise it is left uncaptured,
 //    and Razorpay returns uncaptured money to the customer by itself;
 //  - the confirmation email is recorded in the email outbox in the same transaction that marks the order paid, keyed
-//    per order, so it is sent once.
+//    per order, so it is sent once;
+//  - a refund counts only once Razorpay reports it "processed" (read from the payment's refund list): a requested,
+//    pending or failed refund never marks a payment or an order refunded;
+//  - an order can be paid for ORDER_PAYMENT_TTL_MINUTES after it is placed (Checkout is told how long is left), and is
+//    expired only EXPIRY_GRACE_MS after that, once Razorpay has been asked again, so a payment finishing late is seen first.
 
 const OPEN_STATUSES: PaymentStatus[] = ["CREATED", "FAILED"];
 const RANK: Record<PaymentStatus, number> = { CREATED: 0, FAILED: 0, AUTHORIZED: 1, CAPTURED: 2, PARTIALLY_REFUNDED: 3, REFUNDED: 4 };
 const NOT_DISPATCHED = new Set(["PENDING", "CONFIRMED", "PROCESSING"]);
 const EVENT_NAME = /^[a-z_.]{1,64}$/;
 const EVENT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+// Extra time past the payment deadline before an unpaid order is expired: Checkout's own timeout can run late when the
+// browser pauses timers in a background tab.
+export const EXPIRY_GRACE_MS = 15 * 60_000;
 
 export type PaymentOutcome = "paid" | "already_paid" | "pending" | "failed" | "review" | "refunded" | "ignored";
 type Applied = { outcome: PaymentOutcome; orderId: string | null; capture: { paymentId: string; amountMinor: number } | null; notification: QueuedNotification | null };
@@ -175,8 +182,23 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     }));
   }
 
+  // Razorpay's payment entity may count a refund (amount_refunded, status "refunded") before the money is returned, and a
+  // refund can still fail. Only refunds Razorpay reports as "processed" count; a failed one is recorded for a person.
+  async function withConfirmedRefunds(gateway: RazorpayClient, remote: RemotePayment): Promise<RemotePayment> {
+    if (remote.status !== "captured" && remote.status !== "refunded") return remote;
+    if (remote.status === "captured" && remote.amountRefundedMinor === 0) return remote;
+    const refunds = (await gateway.fetchRefunds(remote.id)).filter((refund) => refund.paymentId === remote.id);
+    const processedMinor = refunds.filter((refund) => refund.status === "processed").reduce((sum, refund) => sum + refund.amountMinor, 0);
+    if (refunds.some((refund) => refund.status === "failed")) {
+      await prisma.payment.updateMany({ where: { providerPaymentId: remote.id }, data: { lastErrorCode: "REFUND_FAILED", lastErrorReason: "refund_failed" } });
+      options.log?.error({ providerPaymentId: remote.id }, "A refund for this payment failed at Razorpay; it needs a person");
+    }
+    return { ...remote, amountRefundedMinor: processedMinor, status: processedMinor >= remote.amountMinor && remote.amountMinor > 0 ? "refunded" : "captured" };
+  }
+
   // Applies Razorpay's answer, captures it if it is authorized and the order can take it, then applies the result.
-  async function settle(gateway: RazorpayClient, remote: RemotePayment): Promise<Applied> {
+  async function settle(gateway: RazorpayClient, reported: RemotePayment): Promise<Applied> {
+    const remote = await withConfirmedRefunds(gateway, reported);
     const first = await apply(remote);
     await outbox.dispatch(first.notification);
     if (!first.capture) return first;
@@ -188,7 +210,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
       // Already captured by someone else, or the outcome is unknown: read the payment back and apply that.
       captured = await gateway.fetchPayment(first.capture.paymentId);
     }
-    const second = await apply(captured);
+    const second = await apply(await withConfirmedRefunds(gateway, captured));
     await outbox.dispatch(second.notification);
     return second;
   }
@@ -206,8 +228,11 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     return outcomes;
   }
 
-  function checkoutResponse(config: { keyId: string; mode: string }, payment: { providerOrderId: string; amountMinor: number; currency: string }, orderId: string) {
-    return { orderId, keyId: config.keyId, mode: config.mode, razorpayOrderId: payment.providerOrderId, amount: payment.amountMinor, currency: payment.currency };
+  // `timeoutSeconds` closes Razorpay Checkout when the time to pay runs out (computed here, so the browser's clock and
+  // its idea of the deadline never matter).
+  function checkoutResponse(config: { keyId: string; mode: string }, payment: { providerOrderId: string; amountMinor: number; currency: string }, orderId: string, payableUntil: Date) {
+    const timeoutSeconds = Math.max(60, Math.floor((payableUntil.getTime() - Date.now()) / 1000));
+    return { orderId, keyId: config.keyId, mode: config.mode, razorpayOrderId: payment.providerOrderId, amount: payment.amountMinor, currency: payment.currency, timeoutSeconds };
   }
 
   return {
@@ -227,11 +252,11 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
         if (order.payments.some((payment) => RANK[payment.status] > 0)) throw httpError(409, "PAYMENT_IN_PROGRESS", "A payment for this order has been received and is being confirmed");
         const totalMinor = toMinor(order.total);
         const open = order.payments.find((payment) => OPEN_STATUSES.includes(payment.status) && payment.amountMinor === totalMinor && !payment.needsReview) ?? null;
-        return { totalMinor, open };
+        return { totalMinor, open, payableUntil: new Date(order.createdAt.getTime() + ttlMs()) };
       };
 
       const first = await prisma.$transaction(payable);
-      if (first.open) return checkoutResponse(config, first.open, orderId);
+      if (first.open) return checkoutResponse(config, first.open, orderId, first.payableUntil);
 
       await checkout.requireVerifiedCheckout(userId);
       const remote = await client().createOrder({ amountMinor: first.totalMinor, currency: "INR", receipt: orderId, notes: { orderId } }).catch(gatewayError);
@@ -244,7 +269,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
         return tx.payment.create({ data: { orderId, providerOrderId: remote.id, amountMinor: again.totalMinor, currency: "INR" } });
       }));
       options.log?.info({ paymentId: payment.id, orderId }, "Payment opened");
-      return checkoutResponse(config, payment, orderId);
+      return checkoutResponse(config, payment, orderId, first.payableUntil);
     },
 
     // Razorpay Checkout's success callback, forwarded by the storefront. The signature only proves the ids came from
@@ -252,9 +277,10 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
     async confirmFromCheckout(userId: string, orderId: string, body: { razorpayOrderId: string; razorpayPaymentId: string; razorpaySignature: string }) {
       const config = readRazorpayConfig();
       if (!ORDER_ID.test(body.razorpayOrderId) || !PAYMENT_ID.test(body.razorpayPaymentId)) throw httpError(400, "PAYMENT_SIGNATURE_INVALID", "This payment could not be verified");
-      const payment = await prisma.payment.findFirst({ where: { providerOrderId: body.razorpayOrderId, orderId, order: { customer: { userId } } }, select: { id: true } });
+      const payment = await prisma.payment.findFirst({ where: { providerOrderId: body.razorpayOrderId, orderId, order: { customer: { userId } } }, select: { id: true, providerOrderId: true } });
       if (!payment) throw httpError(404, "NOT_FOUND", "Payment not found");
-      if (!checkoutSignatureValid(body.razorpayOrderId, body.razorpayPaymentId, body.razorpaySignature, config.keySecret)) {
+      // As Razorpay documents: the signature is checked against the gateway order id this server created and stored.
+      if (!checkoutSignatureValid(payment.providerOrderId, body.razorpayPaymentId, body.razorpaySignature, config.keySecret)) {
         options.log?.warn({ paymentId: payment.id, orderId }, "Checkout payment signature rejected");
         throw httpError(400, "PAYMENT_SIGNATURE_INVALID", "This payment could not be verified");
       }
@@ -293,6 +319,10 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
       const providerOrderId = typeof orderEntity?.id === "string" && ORDER_ID.test(orderEntity.id) ? orderEntity.id : null;
 
       const row = await prisma.paymentWebhookEvent.upsert({ where: { eventId }, create: { eventId, event, providerPaymentId: paymentId }, update: { attempts: { increment: 1 } }, select: { id: true, processedAt: true } });
+      if (event === "refund.failed" && paymentId) {
+        // The refund list read below also records this; this keeps the record even if Razorpay can't be reached now.
+        await prisma.payment.updateMany({ where: { providerPaymentId: paymentId }, data: { lastErrorCode: "REFUND_FAILED", lastErrorReason: "refund_failed" } });
+      }
       if (row.processedAt) return { duplicate: true, outcomes: [] };
 
       let outcomes: PaymentOutcome[] = [];
@@ -339,10 +369,11 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
       return { checked: rows.length, ...tally };
     },
 
-    // Cancels orders left unpaid past ORDER_PAYMENT_TTL_MINUTES and releases their stock. Each order's gateway orders
-    // are read back first: an order with money received (or a gateway that can't be reached) is never cancelled here.
+    // Cancels orders left unpaid past ORDER_PAYMENT_TTL_MINUTES plus EXPIRY_GRACE_MS and releases their stock. Each
+    // order's gateway orders are read back first: an order with money received (or a gateway that can't be reached) is
+    // never cancelled here.
     async expireUnpaidOrders(limit = 25) {
-      const cutoff = new Date(Date.now() - ttlMs());
+      const cutoff = new Date(Date.now() - ttlMs() - EXPIRY_GRACE_MS);
       const due = await prisma.retailOrder.findMany({ where: { status: "PENDING", paymentStatus: "UNPAID", createdAt: { lt: cutoff } }, orderBy: { createdAt: "asc" }, take: limit, select: { id: true, payments: { select: { providerOrderId: true } } } });
       const tally = { due: due.length, expired: 0, kept: 0, errors: 0 };
       let gateway: RazorpayClient | null = null;
@@ -373,6 +404,16 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
         }
       }
       return tally;
+    },
+
+    // Before a customer cancels an order that has gateway orders, read them back from Razorpay and apply what happened,
+    // so money that reached Razorpay but not yet this system blocks the cancellation (PAYMENT_IN_PROGRESS) instead of
+    // landing on a cancelled order. If Razorpay can't be reached, the cancellation is refused rather than guessed.
+    async syncBeforeCustomerCancel(userId: string, orderId: string) {
+      const payments = await prisma.payment.findMany({ where: { orderId, order: { customer: { userId } } }, select: { providerOrderId: true } });
+      if (payments.length === 0) return;
+      const gateway = client();
+      for (const payment of payments) await syncGatewayOrder(gateway, payment.providerOrderId).catch(gatewayError);
     },
 
     // ---- admin ------------------------------------------------------------------------------------------------

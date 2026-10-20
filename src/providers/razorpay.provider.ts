@@ -2,7 +2,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { RazorpayConfig } from "../config/razorpay.js";
 
 // Razorpay REST API (https://api.razorpay.com/v1), HTTP Basic auth with the key id and secret. Only these calls are
-// used: create an order, read a payment, list an order's payments, capture an authorized payment.
+// used: create an order, read a payment, list an order's payments, capture an authorized payment, list a payment's
+// refunds.
 //
 // What comes back is reduced to RemotePayment: ids, amounts, status, method and the fixed error code/step. The rest
 // of Razorpay's payment entity (email, phone, VPA, card network/last4, bank, notes) is dropped here, so it can never
@@ -27,12 +28,19 @@ export type RemotePayment = {
   errorReason: string | null;
 };
 export type RemoteOrder = { id: string; amountMinor: number; currency: string; status: string };
+// A refund's state as Razorpay reports it: "pending" while Razorpay is still trying, "processed" is final and successful,
+// "failed" means the money was not returned.
+export type RemoteRefundStatus = "pending" | "processed" | "failed";
+export type RemoteRefund = { id: string; paymentId: string; amountMinor: number; status: RemoteRefundStatus };
+const REFUND_STATUSES = new Set<RemoteRefundStatus>(["pending", "processed", "failed"]);
+export const REFUND_ID = /^rfnd_[A-Za-z0-9]{6,40}$/;
 
 export type RazorpayClient = {
   createOrder(input: { amountMinor: number; currency: "INR"; receipt: string; notes: Record<string, string> }): Promise<RemoteOrder>;
   fetchPayment(paymentId: string): Promise<RemotePayment>;
   fetchOrderPayments(orderId: string): Promise<RemotePayment[]>;
   capturePayment(paymentId: string, amountMinor: number, currency: "INR"): Promise<RemotePayment>;
+  fetchRefunds(paymentId: string): Promise<RemoteRefund[]>;
 };
 
 // `outcome: "unknown"` means the request may or may not have taken effect at Razorpay (timeout, 5xx, network):
@@ -66,6 +74,15 @@ export function toRemotePayment(entity: unknown): RemotePayment {
     errorCode: fixed(e.error_code),
     errorReason: fixed(e.error_reason),
   };
+}
+
+export function toRemoteRefund(entity: unknown): RemoteRefund {
+  const e = (entity ?? {}) as Record<string, unknown>;
+  const id = typeof e.id === "string" && REFUND_ID.test(e.id) ? e.id : null;
+  const paymentId = typeof e.payment_id === "string" && PAYMENT_ID.test(e.payment_id) ? e.payment_id : null;
+  const status = typeof e.status === "string" && REFUND_STATUSES.has(e.status as RemoteRefundStatus) ? (e.status as RemoteRefundStatus) : null;
+  if (!id || !paymentId || !status) throw new RazorpayError("RAZORPAY_BAD_RESPONSE", null, "unknown");
+  return { id, paymentId, amountMinor: minor(e.amount), status };
 }
 
 // Constant-time comparison of two hex HMACs (lengths are equal by construction once the input is valid hex).
@@ -126,6 +143,13 @@ export function createRazorpayClient(config: Pick<RazorpayConfig, "keyId" | "key
     async capturePayment(paymentId, amountMinor, currency) {
       if (!PAYMENT_ID.test(paymentId)) throw new RazorpayError("RAZORPAY_BAD_ID", null, "rejected");
       return toRemotePayment(await call("POST", `/payments/${paymentId}/capture`, { amount: amountMinor, currency }));
+    },
+    // Razorpay returns the last 10 refunds unless asked for more; 100 is its page maximum, far above what one order sees.
+    async fetchRefunds(paymentId) {
+      if (!PAYMENT_ID.test(paymentId)) throw new RazorpayError("RAZORPAY_BAD_ID", null, "rejected");
+      const list = (await call("GET", `/payments/${paymentId}/refunds?count=100`)) as { items?: unknown };
+      if (!Array.isArray(list.items)) throw new RazorpayError("RAZORPAY_BAD_RESPONSE", null, "unknown");
+      return list.items.map(toRemoteRefund);
     },
   };
 }

@@ -22,6 +22,7 @@ type App = Awaited<ReturnType<typeof import("../../src/app.js")["buildApp"]>>;
 const { RazorpayError, setRazorpayClientForTests } = await import("../../src/providers/razorpay.provider.js");
 type RazorpayClient = import("../../src/providers/razorpay.provider.js").RazorpayClient;
 type RemotePayment = import("../../src/providers/razorpay.provider.js").RemotePayment;
+type RemoteRefund = import("../../src/providers/razorpay.provider.js").RemoteRefund;
 
 const emails: { to: string; subject: string; html: string; text: string }[] = [];
 const { setEmailClientForTests } = await import("../../src/services/email.service.js");
@@ -34,6 +35,7 @@ const rid = () => randomBytes(7).toString("hex");
 class FakeRazorpay implements RazorpayClient {
   orders = new Map<string, { amountMinor: number; receipt: string }>();
   payments = new Map<string, RemotePayment>();
+  refunds: RemoteRefund[] = [];
   calls: string[] = [];
   down = false;
 
@@ -64,15 +66,33 @@ class FakeRazorpay implements RazorpayClient {
     payment.status = "captured";
     return { ...payment };
   }
+  async fetchRefunds(paymentId: string) {
+    this.guard("fetchRefunds");
+    return this.refunds.filter((refund) => refund.paymentId === paymentId).map((refund) => ({ ...refund }));
+  }
   pay(orderId: string, status: "captured" | "authorized" | "failed", amountMinor?: number) {
     const id = `pay_${rid()}`;
     this.payments.set(id, { id, orderId, status, amountMinor: amountMinor ?? this.orders.get(orderId)!.amountMinor, currency: "INR", amountRefundedMinor: 0, method: "upi", errorCode: status === "failed" ? "BAD_REQUEST_ERROR" : null, errorReason: status === "failed" ? "payment_failed" : null });
     return id;
   }
-  refund(paymentId: string, amountMinor: number) {
+  // Like Razorpay's payment entity, amount_refunded and status move as soon as a refund is requested; only the refund
+  // list says whether it was processed. Returns the refund id; settleRefund() moves it to processed or failed.
+  refund(paymentId: string, amountMinor: number, status: RemoteRefund["status"] = "processed") {
     const payment = this.payments.get(paymentId)!;
+    const id = `rfnd_${rid()}`;
+    this.refunds.push({ id, paymentId, amountMinor, status });
     payment.amountRefundedMinor += amountMinor;
     if (payment.amountRefundedMinor >= payment.amountMinor) payment.status = "refunded";
+    return id;
+  }
+  settleRefund(refundId: string, status: "processed" | "failed") {
+    const refund = this.refunds.find((candidate) => candidate.id === refundId)!;
+    refund.status = status;
+    if (status === "failed") {
+      const payment = this.payments.get(refund.paymentId)!;
+      payment.amountRefundedMinor -= refund.amountMinor;
+      if (payment.amountRefundedMinor < payment.amountMinor) payment.status = "captured";
+    }
   }
 }
 
@@ -212,7 +232,9 @@ test("payment opens only after the checkout code, for the server's total, and a 
     assert.deepEqual([unverified.statusCode, unverified.json().error.code], [403, "CHECKOUT_NOT_VERIFIED"]);
 
     const opened = await shop.openPayment({ user, headers }, order.id);
-    assert.deepEqual({ ...opened, razorpayOrderId: "x" }, { orderId: order.id, keyId: KEY_ID, mode: "test", razorpayOrderId: "x", amount: total, currency: "INR" });
+    const { timeoutSeconds, ...shape } = opened as typeof opened & { timeoutSeconds: number };
+    assert.deepEqual({ ...shape, razorpayOrderId: "x" }, { orderId: order.id, keyId: KEY_ID, mode: "test", razorpayOrderId: "x", amount: total, currency: "INR" });
+    assert.ok(timeoutSeconds > 0 && timeoutSeconds <= 60 * 60, "Checkout closes when the time to pay runs out");
     assert.equal(gateway.orders.get(opened.razorpayOrderId)!.amountMinor, total, "the gateway order is for the stored total");
     assert.equal(gateway.orders.get(opened.razorpayOrderId)!.receipt, order.id);
 
@@ -465,7 +487,10 @@ test("expiry cancels unpaid orders and releases stock, but never one whose money
     const unknown = await shop.placedOrder();
     await shop.openPayment(unknown, unknown.order.id);
     const fresh = await shop.placedOrder();
-    for (const o of [abandoned, paidLate, unknown]) await shop.ageOrder(o.order.id, 61);
+    // Past the 60-minute payment window but inside the 15-minute grace: a late Checkout may still finish.
+    const inGrace = await shop.placedOrder();
+    await shop.ageOrder(inGrace.order.id, 70);
+    for (const o of [abandoned, paidLate, unknown]) await shop.ageOrder(o.order.id, 80);
 
     // The gateway is down only for `unknown`'s check: take it down after the others have been read.
     const original = gateway.fetchOrderPayments.bind(gateway);
@@ -483,6 +508,7 @@ test("expiry cancels unpaid orders and releases stock, but never one whose money
     assert.deepEqual([(await shop.order(paidLate.order.id)).paymentStatus, (await shop.order(paidLate.order.id)).status], ["PAID", "CONFIRMED"]);
     assert.equal((await shop.order(unknown.order.id)).status, "PENDING", "kept while its payment can't be checked");
     assert.equal((await shop.order(fresh.order.id)).status, "PENDING", "not yet due");
+    assert.equal((await shop.order(inGrace.order.id)).status, "PENDING", "kept during the grace period");
 
     const expired = await shop.startPayment(abandoned.headers, abandoned.order.id);
     assert.equal(expired.json().error.code, "ORDER_NOT_PAYABLE");
@@ -563,14 +589,19 @@ test("a customer cannot cancel an order while its payment is being confirmed; a 
     const opened = await shop.openPayment(placed, placed.order.id);
     const cancel = () => shop.app.inject({ method: "POST", url: `/api/v1/orders/${placed.order.id}/cancel`, headers: placed.headers });
 
-    // Money reached Razorpay (authorized) but the order has not been told yet: cancelling is refused.
+    // Recorded as AUTHORIZED but not yet applied to the order (e.g. its capture is still in flight): the order service
+    // itself refuses, whatever the route did before it.
     const authorized = gateway.pay(opened.razorpayOrderId, "authorized");
     await shop.app.prisma.payment.update({ where: { providerOrderId: opened.razorpayOrderId }, data: { status: "AUTHORIZED", providerPaymentId: authorized } });
+    const { createOrderService } = await import("../../src/services/order.service.js");
+    await assert.rejects(createOrderService(shop.app.prisma).cancelOrder(placed.user.id, placed.order.id), { code: "PAYMENT_IN_PROGRESS", statusCode: 409 });
+    // Through the route, Razorpay is asked first: the authorized payment is captured and the order paid instead.
     const refused = await cancel();
     assert.equal(refused.statusCode, 409);
-    assert.equal(refused.json().error.code, "PAYMENT_IN_PROGRESS");
-    assert.equal((await shop.order(placed.order.id)).status, "PENDING", "the order is untouched");
-    assert.equal(await shop.reserved(placed.product.id), 1, "the stock stays reserved for the payment");
+    assert.equal(refused.json().error.code, "ORDER_NOT_CANCELLABLE");
+    assert.equal((await shop.order(placed.order.id)).paymentStatus, "PAID");
+    assert.equal((await shop.order(placed.order.id)).status, "CONFIRMED", "paid, not cancelled");
+    assert.equal(await shop.reserved(placed.product.id), 1, "the stock stays reserved for the order");
 
     // A failed (or never-used) gateway order does not block it.
     const other = await shop.placedOrder(1);
@@ -580,4 +611,109 @@ test("a customer cannot cancel an order while its payment is being confirmed; a 
     const allowed = await shop.app.inject({ method: "POST", url: `/api/v1/orders/${other.order.id}/cancel`, headers: other.headers });
     assert.equal(allowed.statusCode, 200, allowed.body);
     assert.equal(allowed.json().data.status, "CANCELLED");
+  }));
+
+test("Checkout is told how long is left to pay; the time runs from when the order was placed", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const placed = await shop.placedOrder();
+    await shop.ageOrder(placed.order.id, 20);
+    const opened = (await shop.openPayment(placed, placed.order.id)) as unknown as { timeoutSeconds: number };
+    assert.ok(opened.timeoutSeconds > 39 * 60 && opened.timeoutSeconds <= 40 * 60, String(opened.timeoutSeconds));
+    await shop.ageOrder(placed.order.id, 61);
+    assert.equal((await shop.startPayment(placed.headers, placed.order.id)).json().error.code, "ORDER_PAYMENT_EXPIRED");
+  }));
+
+test("a refund counts only once Razorpay processes it: a pending refund leaves the order paid, a failed one is recorded", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const placed = await shop.placedOrder(2);
+    const opened = await shop.openPayment(placed, placed.order.id);
+    const paymentId = gateway.pay(opened.razorpayOrderId, "captured");
+    await shop.paymentWebhook("payment.captured", paymentId);
+
+    // Requested (pending): Razorpay's payment already says "refunded", but nothing changes here yet.
+    const refundId = gateway.refund(paymentId, opened.amount, "pending");
+    assert.equal(gateway.payments.get(paymentId)!.status, "refunded");
+    await shop.webhook("refund.created", { refund: { entity: { id: refundId, payment_id: paymentId, amount: opened.amount, status: "pending" } } });
+    let row = await shop.order(placed.order.id);
+    assert.deepEqual([row.paymentStatus, row.status, row.payments[0].status, row.payments[0].amountRefundedMinor], ["PAID", "CONFIRMED", "CAPTURED", 0]);
+    assert.equal(await shop.reserved(placed.product.id), 2, "stock stays with the order");
+
+    // It fails: still paid, and the failure is recorded for a person.
+    gateway.settleRefund(refundId, "failed");
+    await shop.webhook("refund.failed", { refund: { entity: { id: refundId, payment_id: paymentId, amount: opened.amount, status: "failed" } } });
+    row = await shop.order(placed.order.id);
+    assert.deepEqual([row.paymentStatus, row.payments[0].status, row.payments[0].lastErrorCode], ["PAID", "CAPTURED", "REFUND_FAILED"]);
+
+    // A second refund that is processed: now the order is refunded and cancelled, stock released.
+    const retried = gateway.refund(paymentId, opened.amount, "pending");
+    gateway.settleRefund(retried, "processed");
+    await shop.webhook("refund.processed", { refund: { entity: { id: retried, payment_id: paymentId, amount: opened.amount, status: "processed" } } });
+    row = await shop.order(placed.order.id);
+    assert.deepEqual([row.paymentStatus, row.status, row.payments[0].status, row.payments[0].amountRefundedMinor], ["REFUNDED", "CANCELLED", "REFUNDED", opened.amount]);
+    assert.equal(await shop.reserved(placed.product.id), 0);
+  }));
+
+test("the worker applies a refund made in the Razorpay dashboard only once it is processed", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { createPaymentService } = await import("../../src/services/payment.service.js");
+    const placed = await shop.placedOrder();
+    const opened = await shop.openPayment(placed, placed.order.id);
+    const paymentId = gateway.pay(opened.razorpayOrderId, "captured");
+    await shop.paymentWebhook("payment.captured", paymentId);
+    const refundId = gateway.refund(paymentId, opened.amount, "pending");
+    const stale = () => shop.app.prisma.payment.updateMany({ where: { orderId: placed.order.id }, data: { lastSyncedAt: new Date(Date.now() - 7 * 60 * 60_000) } });
+    await stale();
+    await createPaymentService(shop.app.prisma).reconcile(500);
+    assert.equal((await shop.order(placed.order.id)).paymentStatus, "PAID", "pending refund: unchanged");
+    gateway.settleRefund(refundId, "processed");
+    await stale();
+    await createPaymentService(shop.app.prisma).reconcile(500);
+    assert.equal((await shop.order(placed.order.id)).paymentStatus, "REFUNDED");
+  }));
+
+test("a payment Razorpay has taken but this system hasn't seen yet blocks the customer's cancellation", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const placed = await shop.placedOrder();
+    const opened = await shop.openPayment(placed, placed.order.id);
+    // Captured at Razorpay (e.g. auto-capture); the callback and webhook have not arrived.
+    gateway.pay(opened.razorpayOrderId, "captured");
+    const cancel = await shop.app.inject({ method: "POST", url: `/api/v1/orders/${placed.order.id}/cancel`, headers: placed.headers });
+    assert.equal(cancel.statusCode, 409);
+    assert.equal(cancel.json().error.code, "ORDER_NOT_CANCELLABLE", "the payment was applied first, so the order is paid");
+    const row = await shop.order(placed.order.id);
+    assert.deepEqual([row.status, row.paymentStatus, row.payments[0].needsReview], ["CONFIRMED", "PAID", false]);
+    assert.equal(await shop.confirmations(placed.order.id), 1);
+
+    // If Razorpay can't be asked, the cancellation is refused rather than guessed.
+    const other = await shop.placedOrder();
+    await shop.openPayment(other, other.order.id);
+    gateway.down = true;
+    const refused = await shop.app.inject({ method: "POST", url: `/api/v1/orders/${other.order.id}/cancel`, headers: other.headers });
+    gateway.down = false;
+    assert.equal(refused.json().error.code, "PAYMENT_GATEWAY_UNAVAILABLE");
+    assert.equal((await shop.order(other.order.id)).status, "PENDING");
+  }));
+
+test("payment confirmation racing the customer's cancellation: never both, never money on a cancelled order unflagged", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    for (let round = 0; round < 4; round++) {
+      const placed = await shop.placedOrder();
+      const opened = await shop.openPayment(placed, placed.order.id);
+      const paymentId = gateway.pay(opened.razorpayOrderId, "captured");
+      const [confirmed, cancelled] = await Promise.all([
+        shop.confirm(placed.headers, placed.order.id, opened.razorpayOrderId, paymentId),
+        shop.app.inject({ method: "POST", url: `/api/v1/orders/${placed.order.id}/cancel`, headers: placed.headers }),
+      ]);
+      const row = await shop.order(placed.order.id);
+      if (row.status === "CANCELLED") {
+        // Only possible if the cancel won outright; then the payment must be flagged for a refund, never applied.
+        assert.equal(row.paymentStatus, "UNPAID", `round ${round}`);
+        assert.equal(row.payments[0].needsReview, true, `round ${round}`);
+      } else {
+        assert.deepEqual([row.status, row.paymentStatus], ["CONFIRMED", "PAID"], `round ${round}`);
+        assert.equal(cancelled.statusCode, 409, `round ${round}: ${cancelled.body}`);
+        assert.equal(await shop.confirmations(placed.order.id), 1, `round ${round}`);
+      }
+      assert.equal(confirmed.statusCode, 200, `round ${round}: ${confirmed.body}`);
+    }
   }));
