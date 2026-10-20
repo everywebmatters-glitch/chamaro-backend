@@ -18,16 +18,17 @@ export function createPasswordResetRepository(prisma: PrismaClient) {
     // Redeems a token and sets the new password in one transaction. The conditional update is the single-use
     // guarantee: of two concurrent requests with the same token, InnoDB lets exactly one change the row
     // (usedAt NULL -> now); the other then matches nothing. Returns false for an unknown, expired, already-used
-    // or superseded token, and for an inactive or non-customer account, without changing anything.
+    // or superseded token, for an inactive account, and for one whose role is no longer the one the link was issued
+    // for, without changing anything. `candidates` are the token's hash under each role's scope (see hashResetToken).
     // Using the emailed link proves the holder reads mail at the account's address, so it also marks that address
     // verified. `onChanged` runs inside the same transaction once the password has changed (e.g. to record the
     // password-changed email), and its result is returned; if it throws, the whole reset is rolled back.
-    redeem: <T>(tokenHash: string, passwordHash: string, onChanged: (tx: Prisma.TransactionClient, user: PasswordChangedUser, changedAt: Date, tokenId: string) => Promise<T>) =>
+    redeem: <T>(candidates: { tokenHash: string; role: Role }[], passwordHash: string, onChanged: (tx: Prisma.TransactionClient, user: PasswordChangedUser, changedAt: Date, tokenId: string) => Promise<T>) =>
       prisma.$transaction(async (tx): Promise<T | false> => {
         const now = new Date();
-        const record = await tx.passwordResetToken.findUnique({ where: { tokenHash }, include: { user: { select: { id: true, email: true, isActive: true, role: true, emailVerifiedAt: true } } } });
-        // Links are only issued to customers; one issued before the account became an admin must not reset it.
-        if (!record || !record.user.isActive || record.user.role !== "CUSTOMER") return false;
+        const records = await tx.passwordResetToken.findMany({ where: { tokenHash: { in: candidates.map((candidate) => candidate.tokenHash) } }, include: { user: { select: { id: true, email: true, isActive: true, role: true, emailVerifiedAt: true } } } });
+        const record = records.find((row) => candidates.some((candidate) => candidate.tokenHash === row.tokenHash && candidate.role === row.user.role));
+        if (!record || !record.user.isActive) return false;
         const claimed = await tx.passwordResetToken.updateMany({ where: { id: record.id, usedAt: null, expiresAt: { gt: now } }, data: { usedAt: now } });
         if (claimed.count !== 1) return false;
         const user = await tx.user.update({ where: { id: record.userId }, data: { passwordHash, emailVerifiedAt: record.user.emailVerifiedAt ?? now }, select: { id: true, name: true, email: true, role: true, emailVerifiedAt: true } });

@@ -76,7 +76,7 @@ export const forgotPasswordResetRouteSchema = routeSchema(["Authentication"], "R
 
 export const resetTokenPattern = "^[A-Za-z0-9_-]{43}$";
 
-export const forgotPasswordRequestLinkRouteSchema = routeSchema(["Authentication"], "Email a single-use password-reset link (customer accounts)", {
+export const forgotPasswordRequestLinkRouteSchema = routeSchema(["Authentication"], "Email a single-use password-reset link (customers: storefront; admins: admin app)", {
   body: sendOtpBody,
   response: { 200: genericMessageResponseSchema },
 });

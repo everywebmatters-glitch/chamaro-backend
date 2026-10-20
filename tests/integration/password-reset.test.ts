@@ -9,6 +9,7 @@ import { isolatedDatabaseSkipReason } from "../helpers/throwaway-db.js";
 // Read by env.ts at import: lift the per-IP OTP limit so one test can make several requests.
 process.env.OTP_RATE_LIMIT_MAX = "1000";
 process.env.APP_BASE_URL = "https://chamaro.com";
+process.env.ADMIN_BASE_URL = "https://admin.chamaro.com";
 
 const skipReason = await isolatedDatabaseSkipReason();
 type App = Awaited<ReturnType<typeof import("../../src/app.js")["buildApp"]>>;
@@ -68,12 +69,24 @@ class Ctx {
     return match[1];
   }
 
+  // The token from the most recent admin reset email.
+  lastAdminToken(): string {
+    const html = this.sent.at(-1)?.html ?? "";
+    const match = html.match(/href="https:\/\/admin\.chamaro\.com\/reset-password\/#token=([A-Za-z0-9_-]{43})"/);
+    assert.ok(match, "the email links to the admin app's /reset-password/ page");
+    return match[1];
+  }
+
+  adminLogin(email: string, password: string) {
+    return this.app.inject({ method: "POST", url: "/api/v1/auth/admin/login", payload: { email, password } });
+  }
+
   async cleanup() {
     await this.app.prisma.user.deleteMany({ where: { id: { in: this.userIds } } }).catch(() => undefined);
   }
 }
 
-test("request-link answers the same for unknown, inactive, admin and real customer accounts; only the customer gets an email", { skip: skipReason }, () =>
+test("request-link answers the same for unknown, inactive, admin and customer accounts; each active account gets its own site's link", { skip: skipReason }, () =>
   withApp(async (ctx) => {
     const customer = await ctx.user();
     const inactive = await ctx.user({ isActive: false });
@@ -85,9 +98,39 @@ test("request-link answers the same for unknown, inactive, admin and real custom
       bodies.push(res.json());
     }
     for (const body of bodies) assert.deepEqual(body, { success: true, data: { message: GENERIC } });
-    assert.equal(ctx.sent.length, 1);
-    assert.equal(ctx.sent[0].to, customer.email);
-    assert.ok(!ctx.sent[0].html.includes("admin."), "the link never points at the admin domain");
+    assert.deepEqual(ctx.sent.map((message) => message.to), [admin.email, customer.email]);
+    assert.ok(ctx.sent[0].html.includes("https://admin.chamaro.com/reset-password/#token="), "the admin's link opens the admin app");
+    assert.ok(!ctx.sent[1].html.includes("admin."), "a customer's link never points at the admin domain");
+  }));
+
+test("an admin's link resets the admin password once, on the admin app", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    const admin = await ctx.user({ role: "ADMIN" });
+    await ctx.requestLink(admin.email);
+    const token = ctx.lastAdminToken();
+    const [row] = await ctx.app.prisma.passwordResetToken.findMany({ where: { userId: admin.id } });
+    assert.equal(row.tokenHash, createHash("sha256").update(`admin:${token}`).digest("hex"), "stored under the admin scope");
+
+    assert.equal((await ctx.reset(token)).statusCode, 200);
+    assert.equal((await ctx.adminLogin(admin.email, "brand-new-password-2")).statusCode, 200);
+    assert.equal((await ctx.adminLogin(admin.email, PASSWORD)).statusCode, 401);
+    assert.equal((await ctx.reset(token, "another-password-3")).json().error.code, "RESET_TOKEN_INVALID");
+
+    const changed = ctx.sent.find((message) => message.subject === "Your Chamaro password was changed");
+    assert.ok(changed?.html.includes("https://admin.chamaro.com/forgot-password/"), "the password-changed email links the admin reset form");
+  }));
+
+test("a link issued to an admin who is later made a customer or deactivated cannot reset the password", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    for (const change of [{ role: "CUSTOMER" as const }, { isActive: false }]) {
+      const admin = await ctx.user({ role: "ADMIN" });
+      await ctx.requestLink(admin.email);
+      const token = ctx.lastAdminToken();
+      await ctx.app.prisma.user.update({ where: { id: admin.id }, data: change });
+      assert.equal((await ctx.reset(token)).json().error.code, "RESET_TOKEN_INVALID", JSON.stringify(change));
+      const stored = await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: admin.id } });
+      assert.equal(stored.passwordHash, admin.passwordHash, `${JSON.stringify(change)}: password unchanged`);
+    }
   }));
 
 test("only a hash of the token is stored; the link resets the password once and then stops working", { skip: skipReason }, () =>
