@@ -119,8 +119,19 @@ Secrets (Secret Manager, readable by `chamaro-backend`), set by a person from th
 Live keys (`rzp_live_...`) are refused unless the plain setting `RAZORPAY_ALLOW_LIVE_KEYS=true` is also set, so going
 live is a deliberate, separate step. Optional: `ORDER_PAYMENT_TTL_MINUTES` (15-1440, default 60).
 
-Webhook (Razorpay dashboard > Settings > Webhooks), URL `https://api.chamaro.com/api/v1/payments/razorpay/webhook`,
-events `payment.authorized`, `payment.captured`, `payment.failed`, `order.paid`, `refund.processed`.
+Webhook (Razorpay dashboard > Accounts & Settings > Webhooks), set up separately in Test mode and in Live mode, each
+with its own secret, URL `https://api.chamaro.com/api/v1/payments/razorpay/webhook`, events `payment.authorized`,
+`payment.captured`, `payment.failed`, `order.paid`, `refund.created`, `refund.processed`, `refund.failed`. The webhook
+body only says which payment to read: its state is always read back from Razorpay's API with the current keys.
+
+Payment capture (Dashboard): manual capture is recommended. The server captures an authorized payment only while its
+order can still be confirmed; a payment that arrives after the order was cancelled or expired is then never captured,
+and Razorpay returns it to the customer by itself. With automatic capture such money is captured, flagged
+`needsReview`, and must be refunded by a person.
+
+Test mode and live mode: every payment records the key mode it was created with (`Payment.mode`). An order paid with
+test keys is PAID but can never be shipped (`ORDER_PAID_IN_TEST_MODE`; Delhivery dispatch must use the same
+`orderPaidLive()` check), and after switching keys, gateway orders of the other mode are never read back or reused.
 
 One-time setup, after the secrets exist:
 
