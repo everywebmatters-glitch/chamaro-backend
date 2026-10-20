@@ -78,11 +78,12 @@ spec:
                 secretKeyRef:
                   name: RESEND_API_KEY
                   key: latest
+            # The verified sender, Chamaro <no-reply@chamaro.com>. Live since revision chamaro-api-00024-yub.
             - name: RESEND_FROM_EMAIL
               valueFrom:
                 secretKeyRef:
-                  name: RESEND_FROM_EMAIL
-                  key: latest
+                  name: RESEND_FROM_EMAIL_DOMAIN
+                  key: "1"
             # Admin and storefront origins (https://admin.chamaro.com, https://chamaro.com, ...).
             - name: CORS_ORIGIN
               valueFrom:

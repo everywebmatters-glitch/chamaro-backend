@@ -1,6 +1,6 @@
 // Cart, addresses and orders: authorization, validation, server-side pricing, stock reservation and races,
-// duplicate protection and rollback, and the order/shipment emails. Runs only against the isolated local test
-// database. Every email goes to a fake Resend client, never the real one.
+// duplicate protection and rollback, and the order, shipment and cancellation emails (through the email outbox).
+// Runs only against the isolated local test database. Every email goes to a fake Resend client, never the real one.
 import "dotenv/config";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -11,10 +11,10 @@ const skipReason = await isolatedDatabaseSkipReason();
 type App = Awaited<ReturnType<typeof import("../../src/app.js")["buildApp"]>>;
 
 // Emails "sent" by the current test; set failEmails to make the fake provider return an error.
-const outbox: { to: string; subject: string; html: string }[] = [];
+const outbox: { to: string; subject: string; html: string; text: string }[] = [];
 let failEmails = false;
 const { setEmailClientForTests } = await import("../../src/services/email.service.js");
-setEmailClientForTests({ emails: { send: async (message) => { outbox.push(message); return { error: failEmails ? { message: "provider down" } : null }; } } });
+setEmailClientForTests({ emails: { send: async (message) => { outbox.push(message); return failEmails ? { error: { name: "internal_server_error", statusCode: 500, message: "provider down" } } : { data: { id: `re_${outbox.length}` }, error: null }; } } });
 
 async function withShop(run: (shop: Shop) => Promise<void>) {
   outbox.length = 0;
@@ -62,8 +62,10 @@ class Shop {
     return created;
   }
 
-  async customer(label = "c") {
-    const user = await this.app.prisma.user.create({ data: { name: `Customer ${label}`, email: `${label}-${this.unique}-${++this.counter}@example.test`, passwordHash: "unused", role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } }, include: { customer: true } });
+  // A customer whose email address is verified, unless `verified` is false (like every account made before
+  // email verification existed).
+  async customer(label = "c", verified = true) {
+    const user = await this.app.prisma.user.create({ data: { name: `Customer ${label}`, email: `${label}-${this.unique}-${++this.counter}@example.test`, passwordHash: "unused", emailVerifiedAt: verified ? new Date() : null, role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } }, include: { customer: true } });
     this.userIds.push(user.id);
     return { user, customerId: user.customer!.id, headers: { authorization: `Bearer ${this.app.jwt.sign({ sub: user.id, role: "CUSTOMER" })}` } };
   }
@@ -101,11 +103,16 @@ class Shop {
 }
 
 // Customer with an address and a cart of one product, ready to check out.
-async function readyCustomer(shop: Shop, productId: string, quantity = 1, label = "buyer") {
-  const customer = await shop.customer(label);
+async function readyCustomer(shop: Shop, productId: string, quantity = 1, label = "buyer", verified = true) {
+  const customer = await shop.customer(label, verified);
   const address = (await shop.address(customer.headers)).json().data.id as string;
   assert.equal((await shop.putCart(customer.headers, [{ productId, quantity }])).statusCode, 200);
   return { ...customer, address };
+}
+
+// The outbox rows recorded for one order.
+function notificationsFor(app: App, orderId: string) {
+  return app.prisma.emailNotification.findMany({ where: { orderId }, orderBy: { createdAt: "asc" } });
 }
 
 // Stands in for a verified payment-provider confirmation, which the API has no way to record yet. Test database only.
@@ -406,8 +413,9 @@ test("one cart cannot become two orders, even with different keys at the same mo
 
 // ---- order and shipment emails -------------------------------------------------------------------------------------
 
-test("a placed order sends one confirmation; retries and double submits with the same key send no more", { skip: skipReason }, () =>
+test("a placed order sends one payment-pending email; retries and double submits with the same key send no more", { skip: skipReason }, () =>
   withShop(async (shop) => {
+    const { app } = shop;
     const product = await shop.product({ price: "1500.00", stock: 10 });
     const buyer = await readyCustomer(shop, product.id, 2);
     const body = { addressId: buyer.address, shippingMethod: "express" };
@@ -417,11 +425,17 @@ test("a placed order sends one confirmation; retries and double submits with the
     const order = first.json().data;
     assert.equal(outbox.length, 1);
     assert.equal(outbox[0].to, buyer.user.email);
-    assert.equal(outbox[0].subject, `Your Chamaro order ${order.id}`);
-    for (const part of [order.id, product.name, "&times; 2", order.subtotal, order.shippingTotal, order.total, "12 MG Road"]) assert.ok(outbox[0].html.includes(part), part);
+    assert.equal(outbox[0].subject, `Chamaro order ${order.id}: payment pending`);
+    for (const part of [order.id, product.name, "&times; 2", order.subtotal, order.shippingTotal, order.total, "12 MG Road", "Payment for this order is pending"]) assert.ok(outbox[0].html.includes(part), part);
+    assert.match(outbox[0].text, /PAYMENT FOR THIS ORDER IS PENDING/);
+
+    const [row] = await notificationsFor(app, order.id);
+    assert.deepEqual([row.eventKey, row.kind, row.status, row.attempts, row.userId, row.providerMessageId], [`order:${order.id}:placed`, "ORDER_PLACED", "SENT", 1, buyer.user.id, "re_1"]);
+    assert.ok(row.sentAt);
 
     assert.equal((await shop.order(buyer.headers, body, "email-key-0001")).statusCode, 200);
     assert.equal(outbox.length, 1, "a retry sends nothing");
+    assert.equal((await notificationsFor(app, order.id)).length, 1, "a retry records nothing");
 
     const other = await readyCustomer(shop, product.id, 1, "double");
     const burst = await Promise.all([1, 2, 3, 4].map(() => shop.order(other.headers, { addressId: other.address, shippingMethod: "standard" }, "email-burst-0001")));
@@ -440,12 +454,67 @@ test("a failed confirmation email never undoes the order; a rejected order sends
     assert.equal(outbox.length, 1, "the send was attempted");
     assert.equal(await app.prisma.retailOrder.count({ where: { customerId: buyer.customerId } }), 1);
     assert.equal(await shop.reserved(product.id), 1);
+    const stored = await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: placed.json().data.id } });
+    assert.deepEqual([stored.status, stored.paymentStatus], ["PENDING", "UNPAID"], "the order is untouched by the failed email");
+    const [row] = await notificationsFor(app, stored.id);
+    assert.deepEqual([row.status, row.attempts, row.lastErrorName, row.lastErrorStatus], ["PENDING", 1, "internal_server_error", 500], "left for the worker to retry");
+    assert.ok(row.nextAttemptAt.getTime() > Date.now(), "the retry waits");
 
     failEmails = false;
     const late = await readyCustomer(shop, product.id, 1, "late");
     const rejected = await shop.order(late.headers, { addressId: late.address, shippingMethod: "standard" });
     assert.equal(rejected.statusCode, 409);
     assert.equal(outbox.length, 1, "no email for an order that was not placed");
+    assert.equal(await app.prisma.emailNotification.count({ where: { userId: late.user.id } }), 0, "the rolled-back order recorded no email");
+  }));
+
+test("the worker retries a failed order email once it is due, sends it once, and changes only the email row", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const { createEmailOutbox } = await import("../../src/services/email-outbox.service.js");
+    const worker = createEmailOutbox(app.prisma);
+    const product = await shop.product({ stock: 3 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    failEmails = true;
+    const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    const before = await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId } });
+
+    // Not due yet: the worker leaves it alone.
+    await worker.drain();
+    assert.equal(outbox.length, 1);
+
+    // Still failing once due: a second attempt, still nothing else changed.
+    await app.prisma.emailNotification.updateMany({ where: { orderId }, data: { nextAttemptAt: new Date(Date.now() - 1000) } });
+    await worker.drain();
+    assert.equal(outbox.length, 2);
+    assert.equal((await notificationsFor(app, orderId))[0].attempts, 2);
+
+    failEmails = false;
+    await app.prisma.emailNotification.updateMany({ where: { orderId }, data: { nextAttemptAt: new Date(Date.now() - 1000) } });
+    await worker.drain();
+    await worker.drain();
+    assert.equal(outbox.length, 3, "delivered once, then never again");
+    const [row] = await notificationsFor(app, orderId);
+    assert.deepEqual([row.status, row.attempts, row.lastErrorName], ["SENT", 3, null]);
+    const after = await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId } });
+    assert.deepEqual([after.status, after.paymentStatus, after.updatedAt.getTime()], [before.status, before.paymentStatus, before.updatedAt.getTime()], "the worker never touches the order");
+  }));
+
+test("an account whose email address was never verified gets no order emails; they are recorded as skipped", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const product = await shop.product({ stock: 3 });
+    const legacy = await readyCustomer(shop, product.id, 1, "legacy", false);
+    const placed = await shop.order(legacy.headers, { addressId: legacy.address, shippingMethod: "standard" });
+    assert.equal(placed.statusCode, 201, placed.body);
+    const orderId = placed.json().data.id as string;
+    assert.equal((await app.inject({ method: "POST", url: `/api/v1/orders/${orderId}/cancel`, headers: legacy.headers })).statusCode, 200);
+    assert.equal(outbox.length, 0, "nothing sent to an unverified address");
+    const rows = await notificationsFor(app, orderId);
+    assert.deepEqual(rows.map((row) => [row.kind, row.status, row.skipReason, row.attempts]), [["ORDER_PLACED", "SKIPPED", "UNVERIFIED_RECIPIENT", 0], ["ORDER_CANCELLED", "SKIPPED", "UNVERIFIED_RECIPIENT", 0]]);
+    const { createEmailOutbox } = await import("../../src/services/email-outbox.service.js");
+    await createEmailOutbox(app.prisma).drain();
+    assert.equal(outbox.length, 0, "the worker never sends a skipped row");
   }));
 
 test("admin ship: records carrier and tracking, emails once, is idempotent, and refuses final states", { skip: skipReason }, () =>
@@ -469,6 +538,8 @@ test("admin ship: records carrier and tracking, emails once, is idempotent, and 
     assert.equal(outbox.length, 1);
     assert.equal(outbox[0].to, buyer.user.email);
     assert.ok(outbox[0].html.includes("BD-77001") && outbox[0].html.includes("Blue Dart"));
+    assert.ok(outbox[0].text.includes("Tracking number: BD-77001"));
+    assert.deepEqual((await notificationsFor(app, orderId)).filter((row) => row.kind === "ORDER_SHIPPED").map((row) => [row.eventKey, row.status]), [[`order:${orderId}:shipped`, "SENT"]]);
 
     const again = await ship({ carrier: "Blue Dart", trackingNumber: "BD-77001" });
     assert.equal(again.statusCode, 200);
@@ -535,6 +606,7 @@ test("admin ship: concurrent duplicate requests ship once and email once", { ski
     assert.deepEqual(burst.map((response) => response.statusCode), [200, 200, 200, 200]);
     assert.equal(new Set(burst.map((response) => response.json().data.shippedAt)).size, 1, "one shipment time");
     assert.equal(outbox.length, 1, "exactly one shipment email");
+    assert.equal((await notificationsFor(app, orderId)).filter((row) => row.kind === "ORDER_SHIPPED").length, 1, "exactly one recorded");
   }));
 
 test("admin ship: customer tokens and anonymous requests are refused", { skip: skipReason }, () =>
@@ -564,6 +636,8 @@ test("admin ship: a failed shipment email still leaves the order shipped", { ski
     const stored = await app.prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId } });
     assert.equal(stored.status, "SHIPPED");
     assert.equal(stored.trackingNumber, "EE123456789IN");
+    const shippedRow = (await notificationsFor(app, orderId)).find((row) => row.kind === "ORDER_SHIPPED")!;
+    assert.deepEqual([shippedRow.status, shippedRow.attempts, shippedRow.lastErrorName], ["PENDING", 1, "internal_server_error"], "kept for a retry");
   }));
 
 // ---- cancelling ----------------------------------------------------------------------------------------------------
@@ -576,13 +650,20 @@ test("cancelling an unpaid pending order releases its stock once; paid orders ca
     const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
     assert.equal(await shop.reserved(product.id), 3);
 
+    outbox.length = 0;
     const cancelled = await app.inject({ method: "POST", url: `/api/v1/orders/${orderId}/cancel`, headers: buyer.headers });
     assert.equal(cancelled.statusCode, 200, cancelled.body);
     assert.equal(cancelled.json().data.status, "CANCELLED");
     assert.equal(await shop.reserved(product.id), 0);
+    assert.equal(outbox.length, 1, "the customer is told once");
+    assert.equal(outbox[0].to, buyer.user.email);
+    assert.equal(outbox[0].subject, `Your Chamaro order ${orderId} has been cancelled`);
+    assert.ok(outbox[0].html.includes("No payment was taken for this order.") && outbox[0].text.includes("No payment was taken for this order."));
     const twice = await app.inject({ method: "POST", url: `/api/v1/orders/${orderId}/cancel`, headers: buyer.headers });
     assert.equal(twice.statusCode, 200);
     assert.equal(await shop.reserved(product.id), 0, "a second cancel releases nothing more");
+    assert.equal(outbox.length, 1, "a second cancel sends nothing");
+    assert.deepEqual((await notificationsFor(app, orderId)).map((row) => [row.kind, row.status]), [["ORDER_PLACED", "SENT"], ["ORDER_CANCELLED", "SENT"]]);
 
     // Another order that has been paid (as a payment provider confirmation would set it) is not cancelled here.
     await shop.putCart(buyer.headers, [{ productId: product.id, quantity: 2 }]);
@@ -592,6 +673,20 @@ test("cancelling an unpaid pending order releases its stock once; paid orders ca
     assert.equal(refused.statusCode, 409);
     assert.equal(refused.json().error.code, "ORDER_NOT_CANCELLABLE");
     assert.equal(await shop.reserved(product.id), 2);
+    assert.equal((await notificationsFor(app, paidId)).filter((row) => row.kind === "ORDER_CANCELLED").length, 0, "a refused cancel records no email");
+  }));
+
+test("simultaneous cancels of one order: one cancels it and exactly one email is recorded and sent", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const product = await shop.product({ stock: 5 });
+    const buyer = await readyCustomer(shop, product.id, 1);
+    const orderId = (await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" })).json().data.id as string;
+    outbox.length = 0;
+    const burst = await Promise.all([1, 2, 3, 4].map(() => app.inject({ method: "POST", url: `/api/v1/orders/${orderId}/cancel`, headers: buyer.headers })));
+    assert.deepEqual(burst.map((response) => response.statusCode), [200, 200, 200, 200]);
+    assert.equal(outbox.length, 1);
+    assert.equal((await notificationsFor(app, orderId)).filter((row) => row.kind === "ORDER_CANCELLED").length, 1);
   }));
 
 test("the API never marks an order paid", { skip: skipReason }, () =>

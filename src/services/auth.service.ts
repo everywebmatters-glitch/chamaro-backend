@@ -1,13 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { FastifyBaseLogger } from "fastify";
-import type { PrismaClient } from "../../generated/prisma/client.js";
+import type { Prisma, PrismaClient, Role } from "../../generated/prisma/client.js";
 import { env } from "../config/env.js";
 import { hashPassword, verifyPasswordConstantWork } from "../utils/password.js";
 import { createAuthRepository } from "../repositories/auth.repository.js";
 import { createPasswordResetRepository } from "../repositories/password-reset.repository.js";
 import { createOtpService } from "./otp.service.js";
-import { sendPasswordResetLinkEmail } from "./email.service.js";
+import { passwordChangedEmail, sendPasswordResetLinkEmail } from "./email.service.js";
+import { createEmailOutbox, enqueueNotification } from "./email-outbox.service.js";
 import { googleProvider } from "../providers/google.provider.js";
 import type { AdminLoginInput, GoogleIdentity, LoginInput, RegisterInput, SafeUser } from "../types/auth.types.js";
 
@@ -40,10 +41,24 @@ export function passwordResetUrl(token: string): string {
   return `${env.APP_BASE_URL}/reset-password#token=${token}`;
 }
 
+// Records the "your password was changed" email inside the transaction that changed it. Every reset path first
+// proves the holder reads mail at the account's address, so it goes to that (now verified) address. `eventKey`
+// names the change (the reset link or code used), so it is recorded once. Storefront customers get a link to the
+// reset form; admin accounts don't reset there.
+function enqueuePasswordChanged(tx: Prisma.TransactionClient, user: { id: string; name: string; email: string; role: Role; emailVerifiedAt: Date | null }, changedAt: Date, eventKey: string) {
+  return enqueueNotification(tx, {
+    eventKey,
+    kind: "PASSWORD_CHANGED",
+    recipient: { userId: user.id, email: user.email, verified: user.emailVerifiedAt !== null },
+    message: passwordChangedEmail({ name: user.name, changedAt, resetUrl: user.role === "CUSTOMER" ? `${env.APP_BASE_URL}/account/login?reset=1` : null }),
+  });
+}
+
 export function createAuthService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
   const repository = createAuthRepository(prisma);
   const resetTokens = createPasswordResetRepository(prisma);
   const otpService = createOtpService(prisma);
+  const outbox = createEmailOutbox(prisma, { log: options.log });
 
   async function issuePasswordResetLink(email: string): Promise<void> {
     const normalized = email.trim().toLowerCase();
@@ -74,6 +89,8 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
       user = await repository.createGoogleCustomer({ name: identity.name, email: identity.email, googleId: identity.googleId });
     }
     if (!user.isActive) throw accountInactive();
+    // Google vouches only for the address it just returned; an account whose address differs stays as it is.
+    if (!user.emailVerifiedAt && user.email === identity.email) await repository.markEmailVerified(user.id, user.email);
     return user;
   }
 
@@ -153,6 +170,8 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
       // The OTP matched, but the account could have been deactivated/role-changed since it was
       // sent; treat that the same as any other login failure.
       if (!user || !user.isActive || user.role !== "CUSTOMER") throw invalidCredentials();
+      // The code was emailed to this address, so whoever entered it reads mail there.
+      if (!user.emailVerifiedAt) await repository.markEmailVerified(user.id, normalized);
       return user;
     },
 
@@ -173,14 +192,21 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
       await otpService.verifyOtp({ email: normalized, purpose: "FORGOT_PASSWORD", otp, consume: false });
     },
 
+    // The new password, the verified address, the invalidated reset links and the password-changed email are
+    // recorded in one transaction; the email is sent once it has committed.
     async resetPasswordWithOtp(email: string, otp: string, newPassword: string): Promise<void> {
       const normalized = email.trim().toLowerCase();
-      await otpService.verifyOtp({ email: normalized, purpose: "FORGOT_PASSWORD", otp, consume: true });
+      const otpId = await otpService.verifyOtp({ email: normalized, purpose: "FORGOT_PASSWORD", otp, consume: true });
       const user = await repository.findByEmail(normalized);
       if (!user || !user.isActive) throw accountInactive();
       const passwordHash = await hashPassword(newPassword);
-      await repository.updatePassword(user.id, passwordHash);
-      await resetTokens.invalidateForUser(user.id);
+      const notification = await prisma.$transaction(async (tx) => {
+        const changedAt = new Date();
+        const changed = await tx.user.update({ where: { id: user.id }, data: { passwordHash, emailVerifiedAt: user.emailVerifiedAt ?? changedAt }, select: { id: true, name: true, email: true, role: true, emailVerifiedAt: true } });
+        await tx.passwordResetToken.updateMany({ where: { userId: user.id, usedAt: null }, data: { usedAt: changedAt } });
+        return enqueuePasswordChanged(tx, changed, changedAt, `user:${user.id}:password-changed:code:${otpId}`);
+      });
+      await outbox.dispatch(notification);
     },
 
     // Emails a single-use reset link to an active CUSTOMER account (admins keep the code flow, and their reset
@@ -199,7 +225,11 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
 
     async resetPasswordWithToken(token: string, newPassword: string): Promise<void> {
       const passwordHash = await hashPassword(newPassword);
-      if (!(await resetTokens.redeem(hashResetToken(token), passwordHash))) throw resetTokenInvalid();
+      const notification = await resetTokens.redeem(hashResetToken(token), passwordHash, (tx, user, changedAt, tokenId) =>
+        enqueuePasswordChanged(tx, user, changedAt, `user:${user.id}:password-changed:link:${tokenId}`),
+      );
+      if (!notification) throw resetTokenInvalid();
+      await outbox.dispatch(notification);
     },
   };
 }

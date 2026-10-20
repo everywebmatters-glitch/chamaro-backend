@@ -13,13 +13,15 @@ socket, so `DATABASE_URL` has the form
 | `deploy/cloudrun/cloudbuild.yaml` | Builds both images for one commit, checks their contents, smoke-tests the API image, pushes both. |
 | `deploy/cloudrun/service.yaml` | Record of the live `chamaro-api` configuration. Not applied directly (see below). |
 | `deploy/cloudrun/migrate-job.yaml` | Cloud Run job `chamaro-migrate` that runs `prisma migrate deploy`. |
+| `deploy/cloudrun/email-outbox-job.yaml` | Cloud Run job `chamaro-email-outbox`: retries the email outbox (API image, one pass, then exit). |
 
 Images live in `asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images`
 (`chamaro-api`, `chamaro-migrate`), tagged with the short Git commit. Never deploy `latest`.
 
 Secrets (Secret Manager, read by the `chamaro-backend` service account): `DATABASE_URL`, `JWT_SECRET`,
 `CORS_ORIGIN`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`,
-`GOOGLE_FRONTEND_CALLBACK_URL`, `RESEND_API_KEY`, `RESEND_FROM_EMAIL`. Plain settings: `APP_ENV`, `NODE_ENV`,
+`GOOGLE_FRONTEND_CALLBACK_URL`, `RESEND_API_KEY`, and `RESEND_FROM_EMAIL_DOMAIN` (version 1, the verified sender
+`Chamaro <no-reply@chamaro.com>`, read as `RESEND_FROM_EMAIL`). Plain settings: `APP_ENV`, `NODE_ENV`,
 `HOST`, `APP_BASE_URL` (`https://chamaro.com`), optional `PASSWORD_RESET_TOKEN_TTL_MINUTES` (5-120, default 30).
 
 ## Each release
@@ -51,7 +53,14 @@ gcloud run deploy chamaro-api --project $P --region $R --image $REPO/chamaro-api
   --update-env-vars APP_BASE_URL=https://chamaro.com --no-traffic --tag c$TAG
 #    Test it at the tagged URL printed by the command, then move traffic:
 gcloud run services update-traffic chamaro-api --project $P --region $R --to-tags c$TAG=100
+
+# 6. Point the email outbox worker at the same image (creates the job the first time).
+sed "s/<TAG>/$TAG/" deploy/cloudrun/email-outbox-job.yaml > /tmp/email-outbox-job.yaml
+gcloud run jobs replace /tmp/email-outbox-job.yaml --project $P --region $R
 ```
+
+Always pass `--image` to `gcloud run deploy`, and never run a bare `gcloud run services update chamaro-api`: a new
+revision is made from the service template, so it runs whatever image the last deploy left there.
 
 Rollback: `gcloud run services update-traffic chamaro-api --region $R --to-revisions <previous revision>=100`.
 Migrations are additive, so the previous revision keeps working on the migrated schema.
@@ -59,6 +68,36 @@ Migrations are additive, so the previous revision keeps working on the migrated 
 Do not `gcloud run services replace deploy/cloudrun/service.yaml` unless it has first been diffed against
 `gcloud run services describe chamaro-api --region $R --format export`: replace drops any setting missing from the
 file and moves all traffic to the new revision at once.
+
+## Email outbox
+
+Order, shipment, cancellation and password-changed emails are written to the `EmailNotification` table in the same
+transaction as the change, then sent once it commits (see `src/services/email-outbox.service.ts`). If that first
+attempt fails or never finishes, the `chamaro-email-outbox` job retries it: at most 5 attempts in all, waiting 1, 5,
+15 and 60 minutes, never for anything older than 23 hours (Resend keeps idempotency keys for 24 hours, and the
+event key is the idempotency key). Sign-up/login codes and reset links are sent directly and never stored.
+
+Cloud Scheduler starts the job every five minutes, as the `chamaro-outbox-scheduler` service account, which may only
+run this one job (`roles/run.invoker` on it). One-time setup:
+
+```sh
+gcloud services enable cloudscheduler.googleapis.com --project $P
+gcloud iam service-accounts create chamaro-outbox-scheduler --project $P --display-name "Starts the chamaro-email-outbox job"
+gcloud run jobs add-iam-policy-binding chamaro-email-outbox --project $P --region $R \
+  --member serviceAccount:chamaro-outbox-scheduler@$P.iam.gserviceaccount.com --role roles/run.invoker
+gcloud scheduler jobs create http chamaro-email-outbox-every-5-min --project $P --location $R \
+  --schedule "*/5 * * * *" --time-zone Asia/Kolkata --http-method POST \
+  --uri https://run.googleapis.com/v2/projects/$P/locations/$R/jobs/chamaro-email-outbox:run \
+  --oauth-service-account-email chamaro-outbox-scheduler@$P.iam.gserviceaccount.com
+```
+
+Check it without emailing anyone (one self-test row, sent to a Resend test inbox that delivers to nobody):
+`gcloud run jobs execute chamaro-email-outbox --project $P --region $R --wait --args=dist/src/scripts/email-outbox-worker.js,--self-test,delivered@resend.dev`
+
+What the rows mean: `SENT` (the provider accepted it), `PENDING` (waiting for a retry, see `nextAttemptAt`,
+`lastErrorName`), `FAILED` (given up: a provider error name, `outcome_unknown` or `retry_window_expired`),
+`SKIPPED` (`UNVERIFIED_RECIPIENT`: the account never proved it reads that address; nothing was sent).
+To pause sending, pause the scheduler job; requests still record rows, and the first attempt still happens in the API.
 
 ## Notes
 

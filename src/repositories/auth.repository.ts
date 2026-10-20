@@ -15,15 +15,18 @@ export function createAuthRepository(prisma: PrismaClient) {
     createCustomer: (data: { name: string; email: string; passwordHash: string }) =>
       prisma.user.create({ data: { ...data, role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } }, select: safeUserSelect }),
 
+    // Google only signs in accounts whose address it has verified (see google.provider), so the address starts verified.
     createGoogleCustomer: (data: { name: string; email: string; googleId: string }) =>
-      prisma.user.create({ data: { ...data, passwordHash: GOOGLE_OAUTH_NO_PASSWORD, role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } } }),
+      prisma.user.create({ data: { ...data, passwordHash: GOOGLE_OAUTH_NO_PASSWORD, emailVerifiedAt: new Date(), role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } } }),
+
+    // Records that the holder of `email` proved they read mail there. Only while the account still has that address
+    // and was not verified already, so a later address can never inherit an earlier proof.
+    markEmailVerified: (userId: string, email: string) =>
+      prisma.user.updateMany({ where: { id: userId, email, emailVerifiedAt: null }, data: { emailVerifiedAt: new Date() } }),
 
     // Upsert so admins created before their profile existed self-heal on next login.
     recordAdminLogin: (userId: string) =>
       prisma.adminUser.upsert({ where: { userId }, update: { lastLoginAt: new Date() }, create: { userId, lastLoginAt: new Date() } }),
-
-    updatePassword: (userId: string, passwordHash: string) =>
-      prisma.user.update({ where: { id: userId }, data: { passwordHash } }),
   };
 }
 

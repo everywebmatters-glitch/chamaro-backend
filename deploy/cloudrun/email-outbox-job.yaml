@@ -1,0 +1,63 @@
+# Cloud Run job that retries the email outbox: one pass of src/scripts/email-outbox-worker.ts, then exit. It runs the
+# API image (same commit as the chamaro-api revision), with the same service account, Cloud SQL connection and secret
+# references as the service, and only the settings the worker reads. Create or update it with
+#   sed "s/<TAG>/$TAG/" deploy/cloudrun/email-outbox-job.yaml > /tmp/email-outbox-job.yaml
+#   gcloud run jobs replace /tmp/email-outbox-job.yaml --region asia-south1
+# Cloud Scheduler (job chamaro-email-outbox-every-5-min, see README.md) starts it every five minutes.
+#
+# What it may change: EmailNotification rows only. A failed email never touches an order, payment or account.
+# Overlapping executions are safe (each notification is claimed by one sender at a time), and a failed execution is
+# not retried by Cloud Run: the next scheduled run picks up where it left off, within the outbox's own retry limits.
+#
+# Safe check that changes nothing but one self-test row, sent to a Resend test inbox that delivers to nobody:
+#   gcloud run jobs execute chamaro-email-outbox --region asia-south1 --wait --args=dist/src/scripts/email-outbox-worker.js,--self-test,delivered@resend.dev
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: chamaro-email-outbox
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+          maxRetries: 0
+          timeoutSeconds: 300
+          containers:
+            - name: email-outbox
+              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-api:<TAG>
+              command: ["node"]
+              args: ["dist/src/scripts/email-outbox-worker.js"]
+              env:
+                # The image sets APP_ENV=production, so config/env.ts requires CORS_ORIGIN at startup even though the
+                # worker serves no requests.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: DATABASE_URL
+                      key: latest
+                - name: RESEND_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: RESEND_API_KEY
+                      key: latest
+                # The verified sender, Chamaro <no-reply@chamaro.com>: the same secret and version the live service uses.
+                - name: RESEND_FROM_EMAIL
+                  valueFrom:
+                    secretKeyRef:
+                      name: RESEND_FROM_EMAIL_DOMAIN
+                      key: "1"
+                - name: CORS_ORIGIN
+                  valueFrom:
+                    secretKeyRef:
+                      name: CORS_ORIGIN
+                      key: latest
+              resources:
+                limits:
+                  cpu: 1000m
+                  memory: 512Mi

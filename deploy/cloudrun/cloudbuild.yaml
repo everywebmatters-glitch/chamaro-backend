@@ -20,7 +20,8 @@ steps:
     name: gcr.io/cloud-builders/docker
     args: ["build", "--target", "migrate", "-t", "${_REPO}/chamaro-migrate:${_TAG}", "."]
 
-  # The runtime image holds the compiled app and Prisma Client, and no .env file.
+  # The runtime image holds the compiled app, the email outbox worker and Prisma Client, and no .env file. Its Node has
+  # the time zone data that emails need to show Asia/Kolkata times.
   - id: check-runtime-contents
     name: gcr.io/cloud-builders/docker
     args:
@@ -30,7 +31,11 @@ steps:
       - sh
       - ${_REPO}/chamaro-api:${_TAG}
       - -c
-      - test -f dist/src/server.js && test -f dist/generated/prisma/client.js && test ! -e .env && test ! -d src && test ! -d tests && echo runtime image contents OK
+      - >-
+        test -f dist/src/server.js && test -f dist/src/scripts/email-outbox-worker.js && test -f dist/generated/prisma/client.js
+        && test ! -e .env && test ! -d src && test ! -d tests
+        && node -e 'const s=new Intl.DateTimeFormat("en-IN",{timeZone:"Asia/Kolkata",hour:"numeric",minute:"2-digit",hour12:true}).format(new Date("2026-10-18T10:00:00Z"));if(s!=="3:30 pm"){console.error("IST formatting:",s);process.exit(1)}'
+        && echo runtime image contents OK
 
   # Production startup smoke test: the image starts with APP_ENV=production and serves /health (which needs no
   # database; nothing listens on the placeholder database address), and Swagger stays off.

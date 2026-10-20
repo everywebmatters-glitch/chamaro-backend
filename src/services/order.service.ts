@@ -11,7 +11,8 @@ import {
   type CartLineInput,
   type ShippingMethod,
 } from "../shared/order-pricing.js";
-import { sendOrderConfirmationEmail, sendShipmentEmail, type OrderEmailAddress } from "./email.service.js";
+import { orderCancelledEmail, orderPlacedEmail, shipmentEmail, type EmailMessage, type OrderEmailAddress } from "./email.service.js";
+import { createEmailOutbox, enqueueNotification, type NotificationKind } from "./email-outbox.service.js";
 
 // Orders and the server-side cart. Rules that protect the data:
 //  - items come from the customer's stored cart, never from the checkout request; unit prices are read from the
@@ -20,7 +21,8 @@ import { sendOrderConfirmationEmail, sendShipmentEmail, type OrderEmailAddress }
 //    quantity - reservedQuantity >= n), so concurrent buyers can never reserve more than exists;
 //  - the same Idempotency-Key from the same customer returns the order already created, never a second one;
 //  - an order is PENDING and UNPAID; nothing here marks it paid (that needs a verified payment provider);
-//  - customer emails go out only after the transaction has committed, and a failed email never undoes the order.
+//  - customer emails are recorded in the email outbox inside the same transaction and sent only after it has
+//    committed; a failed email never undoes the order (the outbox worker retries it).
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
@@ -71,32 +73,22 @@ function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddress">) {
   };
 }
 
-export function createOrderService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
-  // Only the error code and the provider's error name/status are logged: the provider's message can echo the email,
-  // which holds the customer's address.
-  function logEmailFailure(error: unknown, orderId: string, message: string) {
-    const { code, provider } = error as { code?: unknown; provider?: unknown };
-    options.log?.error({ err: { code, provider }, orderId }, message);
-  }
+// Records one customer email about an order, inside the order's transaction. The recipient is the order's account
+// holder, read in the same transaction; an address they never verified is recorded as skipped, not sent.
+async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: string, orderId: string, event: "placed" | "shipped" | "cancelled", render: (customerName: string) => EmailMessage) {
+  const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { id: true, name: true, email: true, emailVerifiedAt: true } });
+  const kind: NotificationKind = event === "placed" ? "ORDER_PLACED" : event === "shipped" ? "ORDER_SHIPPED" : "ORDER_CANCELLED";
+  return enqueueNotification(tx, {
+    eventKey: `order:${orderId}:${event}`,
+    kind,
+    recipient: { userId: user.id, email: user.email, verified: user.emailVerifiedAt !== null },
+    orderId,
+    message: render(user.name),
+  });
+}
 
-  async function sendConfirmation(userId: string, order: PresentedOrder) {
-    try {
-      const user = await prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true } });
-      if (!user) return;
-      await sendOrderConfirmationEmail(user.email, {
-        id: order.id,
-        createdAt: order.createdAt,
-        customerName: user.name,
-        subtotal: order.subtotal,
-        shippingTotal: order.shippingTotal,
-        total: order.total,
-        shippingMethod: order.shippingMethod,
-        ...emailParts(order),
-      });
-    } catch (error) {
-      logEmailFailure(error, order.id, "Order confirmation email failed");
-    }
-  }
+export function createOrderService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
+  const outbox = createEmailOutbox(prisma, { log: options.log });
 
   async function customerFor(userId: string) {
     return prisma.customer.upsert({ where: { userId }, create: { userId, customerType: "RETAIL" }, update: {}, select: { id: true } });
@@ -259,14 +251,18 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
             include: orderInclude,
           });
           await tx.cartItem.deleteMany({ where: { id: { in: cart.items.map((item) => item.id) } } });
-          return { order: presentOrder(order), replay: false };
+          const presented = presentOrder(order);
+          const notification = await enqueueOrderEmail(tx, userId, order.id, "placed", (customerName) =>
+            orderPlacedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, ...emailParts(presented) }),
+          );
+          return { order: presented, replay: false, notification };
         },
         { maxWait: 5_000, timeout: 20_000 },
       ));
       // The transaction has committed. A replayed Idempotency-Key returns the existing order and sends nothing:
       // the customer lock above means exactly one request per key ever sees replay: false.
-      if (!result.replay) await sendConfirmation(userId, result.order);
-      return result;
+      if (!result.replay) await outbox.dispatch(result.notification);
+      return { order: result.order, replay: result.replay };
     },
 
     async listOrders(userId: string, page: number, limit: number) {
@@ -288,13 +284,14 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
     },
 
     // An unpaid order that is still PENDING can be cancelled by its customer; its stock reservation is released.
+    // The customer is emailed once, by the request that actually cancelled it.
     async cancelOrder(userId: string, orderId: string) {
       const customer = await customerFor(userId);
-      return retryOnConflict(() => prisma.$transaction(async (tx) => {
+      const result = await retryOnConflict(() => prisma.$transaction(async (tx) => {
         const locked = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM RetailOrder WHERE id = ${orderId} AND customerId = ${customer.id} FOR UPDATE`;
         if (locked.length === 0) throw httpError(404, "NOT_FOUND", "Order not found");
         const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: orderInclude });
-        if (order.status === "CANCELLED") return presentOrder(order);
+        if (order.status === "CANCELLED") return { order: presentOrder(order), notification: null };
         if (order.status !== "PENDING" || order.paymentStatus !== "UNPAID") throw httpError(409, "ORDER_NOT_CANCELLABLE", "This order can no longer be cancelled here");
 
         const released = unitsPerProduct(order.items);
@@ -304,9 +301,14 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
           const quantity = released.get(productId)!;
           await tx.$executeRaw`UPDATE Inventory SET reservedQuantity = GREATEST(reservedQuantity - ${quantity}, 0), updatedAt = NOW(3) WHERE productId = ${productId}`;
         }
-        const cancelled = await tx.retailOrder.update({ where: { id: orderId }, data: { status: "CANCELLED" }, include: orderInclude });
-        return presentOrder(cancelled);
+        const cancelled = presentOrder(await tx.retailOrder.update({ where: { id: orderId }, data: { status: "CANCELLED" }, include: orderInclude }));
+        const notification = await enqueueOrderEmail(tx, userId, orderId, "cancelled", (customerName) =>
+          orderCancelledEmail({ id: cancelled.id, customerName, items: emailParts(cancelled).items, total: cancelled.total, cancelledAt: cancelled.updatedAt }),
+        );
+        return { order: cancelled, notification };
       }));
+      await outbox.dispatch(result.notification);
+      return result.order;
     },
 
     // ---- admin -----------------------------------------------------------------------------------------------
@@ -334,7 +336,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         if (locked.length === 0) throw httpError(404, "NOT_FOUND", "Order not found");
         const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: adminOrderInclude });
         if (order.status === "SHIPPED") {
-          if (order.carrier === input.carrier && order.trackingNumber === input.trackingNumber) return { order, shipped: false };
+          if (order.carrier === input.carrier && order.trackingNumber === input.trackingNumber) return { order, notification: null };
           throw httpError(409, "ORDER_ALREADY_SHIPPED", "This order has already been marked as shipped");
         }
         if (!SHIPPABLE_STATUSES.has(order.status)) throw httpError(409, "ORDER_NOT_SHIPPABLE", `A ${order.status.toLowerCase()} order can't be marked as shipped`);
@@ -344,25 +346,15 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
           data: { status: "SHIPPED", carrier: input.carrier, trackingNumber: input.trackingNumber, shippedAt: new Date() },
           include: adminOrderInclude,
         });
-        return { order: shipped, shipped: true };
+        const presented = presentOrder(shipped);
+        const notification = await enqueueOrderEmail(tx, shipped.customer.user.id, orderId, "shipped", (customerName) =>
+          shipmentEmail({ id: presented.id, customerName, carrier: input.carrier, trackingNumber: input.trackingNumber, shippedAt: shipped.shippedAt!, ...emailParts(presented) }),
+        );
+        return { order: shipped, notification };
       }));
 
-      const order = presentOrder(result.order);
-      if (result.shipped) {
-        try {
-          await sendShipmentEmail(result.order.customer.user.email, {
-            id: order.id,
-            customerName: result.order.customer.user.name,
-            carrier: input.carrier,
-            trackingNumber: input.trackingNumber,
-            shippedAt: result.order.shippedAt!,
-            ...emailParts(order),
-          });
-        } catch (error) {
-          logEmailFailure(error, order.id, "Shipment email failed");
-        }
-      }
-      return order;
+      await outbox.dispatch(result.notification);
+      return presentOrder(result.order);
     },
 
     async adminGetOrder(orderId: string) {

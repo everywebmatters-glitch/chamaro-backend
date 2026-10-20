@@ -53,8 +53,9 @@ export function createOtpService(prisma: PrismaClient) {
     // mismatch, increments the shared attempt counter and throws OTP_INVALID. On match, marks
     // the code consumed only when `consume` is true (default) -- pass false for a non-final
     // "check" step (e.g. forgot-password's verify-otp) whose later step (reset) re-validates
-    // and performs the actual consumption.
-    async verifyOtp(params: { email: string; purpose: OtpPurpose; otp: string; consume?: boolean }): Promise<void> {
+    // and performs the actual consumption. Returns the matched code's id (an identifier for this verification,
+    // never the code itself).
+    async verifyOtp(params: { email: string; purpose: OtpPurpose; otp: string; consume?: boolean }): Promise<string> {
       const email = params.email.trim().toLowerCase();
       const record = await repository.findActive(email, params.purpose);
       if (!record) throw otpInvalid();
@@ -66,6 +67,7 @@ export function createOtpService(prisma: PrismaClient) {
         throw otpInvalid();
       }
       if (params.consume ?? true) await repository.markConsumed(record.id);
+      return record.id;
     },
   };
 }

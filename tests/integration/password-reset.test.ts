@@ -12,7 +12,7 @@ process.env.APP_BASE_URL = "https://chamaro.com";
 
 const skipReason = await isolatedDatabaseSkipReason();
 type App = Awaited<ReturnType<typeof import("../../src/app.js")["buildApp"]>>;
-type Sent = { to: string; subject: string; html: string };
+type Sent = { to: string; subject: string; html: string; text: string };
 
 const GENERIC = "If an account exists for this email, a password reset link has been sent.";
 const PASSWORD = "original-password-1";
@@ -208,3 +208,92 @@ test("a failed email still gets the generic answer (no 502 that would reveal the
     },
     async () => ({ error: { message: "provider down" } }),
   ));
+
+// ---- password-changed email and email verification ----------------------------------------------------------------
+
+const CHANGED = "Your Chamaro password was changed";
+
+test("a reset by link verifies the address and sends one password-changed email, with no token in it", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    const customer = await ctx.user();
+    assert.equal(customer.emailVerifiedAt, null, "an account made before verification existed starts unverified");
+    await ctx.requestLink(customer.email);
+    const token = ctx.lastToken();
+    assert.equal((await ctx.reset(token)).statusCode, 200);
+
+    const changed = ctx.sent.filter((message) => message.subject === CHANGED);
+    assert.equal(changed.length, 1);
+    assert.equal(changed[0].to, customer.email);
+    assert.ok(changed[0].html.includes("https://chamaro.com/account/login?reset=1"), "links the reset form");
+    assert.ok(!changed[0].html.includes(token) && !changed[0].text.includes(token), "the used token is not in the email");
+    assert.ok((await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: customer.id } })).emailVerifiedAt, "using the emailed link verified the address");
+
+    const rows = await ctx.app.prisma.emailNotification.findMany({ where: { userId: customer.id } });
+    assert.equal(rows.length, 1, "the reset link itself is never stored in the outbox");
+    assert.deepEqual([rows[0].kind, rows[0].status, rows[0].toEmail], ["PASSWORD_CHANGED", "SENT", customer.email]);
+    assert.match(rows[0].eventKey, new RegExp(`^user:${customer.id}:password-changed:link:`));
+    assert.ok(!JSON.stringify(rows[0]).includes(token));
+
+    assert.equal((await ctx.reset(token)).statusCode, 400);
+    assert.equal(ctx.sent.filter((message) => message.subject === CHANGED).length, 1, "a refused reuse sends nothing");
+  }));
+
+test("a reset by code sends one password-changed email; admins get no storefront reset link; the code is not stored", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    for (const role of ["CUSTOMER", "ADMIN"] as const) {
+      const user = await ctx.user({ role });
+      await ctx.app.inject({ method: "POST", url: "/api/v1/auth/forgot-password/send-otp", payload: { email: user.email } });
+      const otp = ctx.sent.at(-1)!.html.match(/>(\d{6})<\/div>/)![1];
+      const res = await ctx.app.inject({ method: "POST", url: "/api/v1/auth/forgot-password/reset", payload: { email: user.email, otp, newPassword: "otp-password-6" } });
+      assert.equal(res.statusCode, 200, res.body);
+      const changed = ctx.sent.at(-1)!;
+      assert.deepEqual([changed.subject, changed.to], [CHANGED, user.email], role);
+      assert.equal(changed.html.includes("reset=1"), role === "CUSTOMER", `${role}: reset link only for customers`);
+      const rows = await ctx.app.prisma.emailNotification.findMany({ where: { userId: user.id } });
+      assert.deepEqual(rows.map((row) => [row.kind, row.status]), [["PASSWORD_CHANGED", "SENT"]], role);
+      assert.ok(!JSON.stringify(rows).includes(otp), `${role}: the code is not stored`);
+      assert.ok((await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: user.id } })).emailVerifiedAt, `${role}: verified`);
+    }
+  }));
+
+test("a failed password-changed email never undoes the reset; it is kept for a retry", { skip: skipReason }, () => {
+  let failing = false;
+  return withApp(
+    async (ctx) => {
+      const customer = await ctx.user();
+      await ctx.requestLink(customer.email);
+      const token = ctx.lastToken();
+      failing = true;
+      assert.equal((await ctx.reset(token)).statusCode, 200);
+      assert.equal((await ctx.login(customer.email, "brand-new-password-2")).statusCode, 200, "the new password works");
+      const [row] = await ctx.app.prisma.emailNotification.findMany({ where: { userId: customer.id } });
+      assert.deepEqual([row.kind, row.status, row.attempts, row.lastErrorName], ["PASSWORD_CHANGED", "PENDING", 1, "internal_server_error"]);
+    },
+    async () => (failing ? { error: { name: "internal_server_error", statusCode: 500, message: "down" } } : { error: null }),
+  );
+});
+
+test("a refused reset (expired link, wrong code) records no email and verifies nothing", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    const customer = await ctx.user();
+    const token = randomBytes(32).toString("base64url");
+    await ctx.app.prisma.passwordResetToken.create({ data: { userId: customer.id, tokenHash: createHash("sha256").update(token).digest("hex"), expiresAt: new Date(Date.now() - 1000) } });
+    assert.equal((await ctx.reset(token)).statusCode, 400);
+    await ctx.app.inject({ method: "POST", url: "/api/v1/auth/forgot-password/send-otp", payload: { email: customer.email } });
+    const wrong = await ctx.app.inject({ method: "POST", url: "/api/v1/auth/forgot-password/reset", payload: { email: customer.email, otp: "000000", newPassword: "otp-password-7" } });
+    assert.equal(wrong.statusCode, 400);
+    assert.equal(await ctx.app.prisma.emailNotification.count({ where: { userId: customer.id } }), 0);
+    assert.equal((await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: customer.id } })).emailVerifiedAt, null);
+  }));
+
+test("signing in with an emailed login code verifies the address; a password login does not", { skip: skipReason }, () =>
+  withApp(async (ctx) => {
+    const customer = await ctx.user();
+    assert.equal((await ctx.login(customer.email, PASSWORD)).statusCode, 200);
+    assert.equal((await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: customer.id } })).emailVerifiedAt, null, "a password proves nothing about the inbox");
+    await ctx.app.inject({ method: "POST", url: "/api/v1/auth/send-login-otp", payload: { email: customer.email } });
+    const otp = ctx.sent.at(-1)!.html.match(/>(\d{6})<\/div>/)![1];
+    const res = await ctx.app.inject({ method: "POST", url: "/api/v1/auth/verify-login-otp", payload: { email: customer.email, otp } });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.ok((await ctx.app.prisma.user.findUniqueOrThrow({ where: { id: customer.id } })).emailVerifiedAt);
+  }));

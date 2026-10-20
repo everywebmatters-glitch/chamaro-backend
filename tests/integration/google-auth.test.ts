@@ -101,6 +101,7 @@ test("Google OAuth browser flow: state, callback redirects, PKCE code exchange, 
     const code = params.get("code");
     assert.ok(code);
     assert.equal(new URL(String(success.headers.location)).search, "", "code travels in the fragment, not the query");
+    assert.ok((await app.prisma.user.findUniqueOrThrow({ where: { googleId: identity.googleId } })).emailVerifiedAt, "Google verified the address, so the new account starts verified");
 
     // Exchange code is not an access token
     assert.equal((await app.inject({ method: "GET", url: "/api/v1/auth/me", headers: { authorization: `Bearer ${code}` } })).statusCode, 401);
