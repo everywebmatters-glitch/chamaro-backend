@@ -8,7 +8,8 @@ import "dotenv/config";
 //   DELHIVERY_API_BASE_URL     https://staging-express.delhivery.com, or https://track.delhivery.com in production only.
 //   DELHIVERY_PICKUP_LOCATION  the warehouse name exactly as registered with Delhivery (case sensitive).
 //   DELHIVERY_WEBHOOK_SECRET   secret, 32+ characters: the bearer token Delhivery's scan push must send.
-//   DELHIVERY_SELLER_GST_TIN, DELHIVERY_HSN_CODE   optional; sent with every shipment when set.
+//   DELHIVERY_SELLER_GST_TIN, DELHIVERY_HSN_CODE   sent with every shipment. Required with the production host:
+//                              Delhivery's order-creation reference lists seller_gst_tin and hsn_code as mandatory.
 //   DELHIVERY_TIMEOUT_MS       optional, 2000-60000 (default 15000).
 //   DELHIVERY_AUTO_BOOKING     "true" books a Delhivery shipment automatically once a live payment is verified (the
 //                              shipment worker does the booking). Needs DELHIVERY_ENABLED too; off = admins book.
@@ -79,6 +80,7 @@ export function readDelhiveryConfig(env: NodeJS.ProcessEnv = process.env): Delhi
   if (sellerGstTin && !/^[0-9A-Z]{15}$/.test(sellerGstTin)) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_SELLER_GST_TIN must be a 15-character GSTIN");
   const hsnCode = setting(env, "DELHIVERY_HSN_CODE");
   if (hsnCode && !/^[0-9]{4,8}$/.test(hsnCode)) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_HSN_CODE must be 4 to 8 digits");
+  if (environment === "production" && (!sellerGstTin || !hsnCode)) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_SELLER_GST_TIN and DELHIVERY_HSN_CODE are required for Delhivery production shipments");
 
   const rawTimeout = setting(env, "DELHIVERY_TIMEOUT_MS");
   const timeoutMs = rawTimeout ? Number(rawTimeout) : 15_000;

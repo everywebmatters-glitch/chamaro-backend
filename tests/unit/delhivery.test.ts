@@ -48,7 +48,12 @@ test("config: Delhivery production is refused outside APP_ENV=production, and st
   assert.throws(() => readDelhiveryConfig(env({ DELHIVERY_API_BASE_URL: "https://track.delhivery.com" })), /only APP_ENV=production may use it/);
   assert.throws(() => readDelhiveryConfig(env({ DELHIVERY_API_BASE_URL: "https://track.delhivery.com", APP_ENV: "staging" })), /only APP_ENV=production may use it/);
   assert.throws(() => readDelhiveryConfig(env({ APP_ENV: "production" })), /staging while APP_ENV=production/);
-  assert.equal(readDelhiveryConfig(env({ DELHIVERY_API_BASE_URL: "https://track.delhivery.com", APP_ENV: "production" })).environment, "production");
+  // Delhivery's order-creation reference lists seller_gst_tin and hsn_code as mandatory: production needs both.
+  const prod = { DELHIVERY_API_BASE_URL: "https://track.delhivery.com", APP_ENV: "production" };
+  assert.throws(() => readDelhiveryConfig(env(prod)), /DELHIVERY_SELLER_GST_TIN and DELHIVERY_HSN_CODE are required/);
+  assert.throws(() => readDelhiveryConfig(env({ ...prod, DELHIVERY_SELLER_GST_TIN: "29ABCDE1234F1Z5" })), /are required/);
+  assert.throws(() => readDelhiveryConfig(env({ ...prod, DELHIVERY_HSN_CODE: "9401" })), /are required/);
+  assert.equal(readDelhiveryConfig(env({ ...prod, DELHIVERY_SELLER_GST_TIN: "29ABCDE1234F1Z5", DELHIVERY_HSN_CODE: "9401" })).environment, "production");
 });
 
 test("config: the webhook secret must be set, long and not a placeholder", () => {

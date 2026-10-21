@@ -40,6 +40,12 @@ spec:
                   value: "false"
                 - name: DELHIVERY_API_BASE_URL
                   value: https://track.delhivery.com
+                # Required with the production host (Delhivery lists them as mandatory): the seller's own GSTIN and the
+                # HSN code of what is shipped. Not secrets; set the real values here and on chamaro-api before enabling.
+                # - name: DELHIVERY_SELLER_GST_TIN
+                #   value: <15-character GSTIN>
+                # - name: DELHIVERY_HSN_CODE
+                #   value: <4-8 digit HSN code>
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef:
