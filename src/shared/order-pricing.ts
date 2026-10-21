@@ -32,7 +32,15 @@ export function unitPriceMinor(product: { price: Amount }, variant?: { price: Am
   return toMinor(variant?.price != null ? variant.price : product.price);
 }
 
-export function shippingMinor(method: ShippingMethod, subtotalMinor: number): number {
+// TEMPORARY (launch testing): FREE_SHIPPING_FOR_ALL=true on the API makes every shipping method free for every order.
+// The storefront shows the same thing from its own FREE_SHIPPING_FOR_ALL constant (webapp/app/lib/cart.ts); change
+// both together, or the price shown and the amount charged will differ. Unset (default) = the rules above.
+export function freeShippingForAll(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.FREE_SHIPPING_FOR_ALL === "true";
+}
+
+export function shippingMinor(method: ShippingMethod, subtotalMinor: number, freeForAll = freeShippingForAll()): number {
+  if (freeForAll) return 0;
   const rule = SHIPPING_RULES[method];
   return rule.freeFromMinor !== null && subtotalMinor >= rule.freeFromMinor ? 0 : rule.priceMinor;
 }

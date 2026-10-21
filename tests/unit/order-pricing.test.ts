@@ -53,3 +53,13 @@ test("units per product add up across variants", () => {
   const totals = unitsPerProduct([{ productId: "p1", quantity: 2 }, { productId: "p1", quantity: 3 }, { productId: "p2", quantity: 1 }]);
   assert.deepEqual([...totals], [["p1", 5], ["p2", 1]]);
 });
+
+test("FREE_SHIPPING_FOR_ALL=true makes every method free for every order; unset keeps the normal rules", async () => {
+  const { freeShippingForAll } = await import("../../src/shared/order-pricing.js");
+  assert.equal(freeShippingForAll({ FREE_SHIPPING_FOR_ALL: "true" }), true);
+  for (const value of [undefined, "", "false", "1", "TRUE"]) assert.equal(freeShippingForAll({ FREE_SHIPPING_FOR_ALL: value }), false, String(value));
+  assert.equal(shippingMinor("standard", 10_000, true), 0);
+  assert.equal(shippingMinor("express", 10_000, true), 0);
+  assert.equal(shippingMinor("standard", 10_000, false), 49_900);
+  assert.equal(shippingMinor("express", 5_000_000, false), 99_900);
+});
