@@ -18,6 +18,7 @@ import { toMinor } from "../shared/order-pricing.js";
 import { createCheckoutService } from "./checkout.service.js";
 import { orderCancelledEmail, orderConfirmedEmail } from "./email.service.js";
 import { createEmailOutbox, type QueuedNotification } from "./email-outbox.service.js";
+import { queueCourierBooking } from "./fulfillment.js";
 import { emailParts, enqueueOrderEmail, orderInclude, presentOrder, releaseReservation, retryOnConflict } from "./order.service.js";
 
 // Razorpay payments for retail orders. Rules that protect the money and the data:
@@ -166,6 +167,9 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
       if (captured && amountOk && !reviewed) {
         if (order.paymentStatus === "UNPAID" && order.status === "PENDING" && !otherPaying) {
           await tx.retailOrder.update({ where: { id: order.id }, data: { paymentStatus: "PAID", status: "CONFIRMED" } });
+          // Real money only: a test-mode payment never books a courier. In this same transaction, so the booking is
+          // recorded exactly when the order becomes paid; the worker calls Delhivery after this commits.
+          if (payment.mode === "live") await queueCourierBooking(tx, order.id);
           const presented = presentOrder(order);
           result.notification = await enqueueOrderEmail(tx, order.customer.userId, order.id, "confirmed", (customerName) =>
             orderConfirmedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, paidAt: now, ...emailParts(presented) }),

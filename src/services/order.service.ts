@@ -374,7 +374,8 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         const locked = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM RetailOrder WHERE id = ${orderId} FOR UPDATE`;
         if (locked.length === 0) throw httpError(404, "NOT_FOUND", "Order not found");
         const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: adminOrderInclude });
-        if (order.shipment) throw httpError(409, "SHIPMENT_MANAGED_BY_COURIER", "This order has a Delhivery shipment; its status comes from Delhivery tracking");
+        const unsentBooking = order.shipment && !order.shipment.waybill && (order.shipment.status === "QUEUED" || (order.shipment.status === "CREATE_FAILED" && !order.shipment.needsReconcile));
+        if (order.shipment && !unsentBooking) throw httpError(409, "SHIPMENT_MANAGED_BY_COURIER", "This order has a Delhivery shipment; its status comes from Delhivery tracking");
         if (order.status === "SHIPPED") {
           if (order.carrier === input.carrier && order.trackingNumber === input.trackingNumber) return { order, notification: null };
           throw httpError(409, "ORDER_ALREADY_SHIPPED", "This order has already been marked as shipped");
@@ -384,6 +385,8 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         // Same rule as payment.service orderPaidLive: a sandbox (test-mode) payment moves no real money.
         const livePayments = await tx.payment.count({ where: { orderId, mode: "live", needsReview: false, status: { in: ["CAPTURED", "PARTIALLY_REFUNDED"] } } });
         if (livePayments === 0) throw httpError(409, "ORDER_PAID_IN_TEST_MODE", "This order was paid with Razorpay test keys; it can't be shipped");
+        // Shipped by hand instead: withdraw the courier booking that never reached Delhivery.
+        if (unsentBooking) await tx.shipment.update({ where: { id: order.shipment!.id }, data: { status: "CANCELLED", cancelledAt: new Date(), lastErrorCode: "SHIPPED_BY_HAND", lastErrorRemark: "Shipped by hand instead of through Delhivery" } });
         const shipped = await tx.retailOrder.update({
           where: { id: orderId },
           data: { status: "SHIPPED", carrier: input.carrier, trackingNumber: input.trackingNumber, shippedAt: new Date() },

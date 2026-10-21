@@ -1,4 +1,5 @@
-// Shipment tracking worker: one pass over Delhivery shipments that are still moving, then exit. Meant to run as a
+// Shipment worker: books queued shipments with Delhivery (when DELHIVERY_AUTO_BOOKING is on), then one pass over
+// Delhivery shipments that are still moving, then exit. Meant to run as a
 // Cloud Run job started by Cloud Scheduler (see deploy/cloudrun/shipment-tracking-job.yaml); it is not deployed yet.
 //
 //   node dist/src/scripts/shipment-tracking-worker.js
@@ -7,7 +8,7 @@
 // well inside Delhivery's 750 calls per 5 minutes) and applies it, recording the shipped/delivered emails exactly once.
 // With DELHIVERY_ENABLED unset it does nothing and exits successfully.
 import { createScriptPrisma } from "./prisma.js";
-import { shippingEnabled } from "../config/delhivery.js";
+import { autoBookingEnabled, shippingEnabled } from "../config/delhivery.js";
 import { createShipmentService } from "../services/shipment.service.js";
 
 // Structured lines for Cloud Logging: ids and error codes only, never addresses, tokens or response bodies.
@@ -24,6 +25,8 @@ async function run() {
   const prisma = createScriptPrisma();
   try {
     const service = createShipmentService(prisma, { log: log as never });
+    // Automatic booking first (queued by verified live payments), so a new shipment is tracked in the same run.
+    if (autoBookingEnabled()) log.info(await service.bookDue(), "Courier booking pass finished");
     for (let pass = 1; pass <= MAX_PASSES; pass++) {
       const result = await service.syncDue();
       log.info({ pass, ...result }, "Shipment tracking pass finished");

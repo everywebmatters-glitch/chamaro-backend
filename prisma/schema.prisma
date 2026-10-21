@@ -168,6 +168,12 @@ model Product {
   // NULL means the storefront's own wording.
   shortDescription  String?            @db.VarChar(500)
   infoBoxes         Json?
+  // The packed parcel for ONE unit, as the courier will weigh and measure it. NULL = not entered: an order needing it
+  // is never booked with a courier automatically; it waits for an admin to enter the parcel (nothing is guessed).
+  weightGrams       Int?
+  lengthCm          Int?
+  widthCm           Int?
+  heightCm          Int?
   price             Decimal            @db.Decimal(12, 2)
   compareAtPrice    Decimal?           @db.Decimal(12, 2)
   sku               String?            @unique @db.VarChar(191)
@@ -542,6 +548,8 @@ enum ShipmentStatus {
   RETURN_IN_TRANSIT
   RETURNED
   CANCELLED
+  // Waiting for the shipment worker to book it with Delhivery (automatic booking after a verified live payment).
+  QUEUED
 }
 
 // One courier shipment per order (orderId is unique), so a retried or concurrent create can never make a second one.
@@ -565,6 +573,10 @@ model Shipment {
   attempts               Int             @default(0)
   lockedUntil            DateTime?
   needsReconcile         Boolean         @default(false)
+  // Queued by the payment that paid the order (not by an admin). Only such rows are booked and retried by the worker.
+  autoBooked             Boolean         @default(false)
+  // The worker does not try again before this (backoff after an attempt whose outcome Delhivery left unknown).
+  nextAttemptAt          DateTime?
   // A fixed error code, plus Delhivery's short remark (e.g. "Duplicate order id"). Admin only; never a token.
   lastErrorCode          String?         @db.VarChar(64)
   lastErrorRemark        String?         @db.VarChar(255)

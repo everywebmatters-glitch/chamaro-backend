@@ -26,6 +26,13 @@ import { orderPaidLive } from "./payment.service.js";
 //    report, keyed per order and event, so a repeated scan, sync or webhook never sends them twice.
 
 const CREATE_LEASE_MS = 60_000;
+// Automatic booking: attempts allowed (each one first asks Delhivery whether the shipment already exists when the
+// previous outcome was unknown), and the wait before attempt 2, 3, 4 and 5.
+export const AUTO_BOOKING_MAX_ATTEMPTS = 5;
+const AUTO_RETRY_MINUTES = [2, 10, 30, 120];
+// Refusals that mean the order should not be booked at all any more (refunded, cancelled, shipped by hand meanwhile):
+// the queued booking is withdrawn. Any other refusal is left for an admin.
+const NOT_TO_BE_BOOKED = new Set(["ORDER_NOT_PAID", "ORDER_NOT_PAID_LIVE", "ORDER_NOT_SHIPPABLE", "ORDER_ALREADY_SHIPPED"]);
 const PICKUP_LEASE_MS = 2 * 60_000;
 // Delhivery: an e-waybill is mandatory when the shipment value is Rs. 50,000 or more.
 const EWAYBILL_THRESHOLD_MINOR = 50_000 * 100;
@@ -186,17 +193,23 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
 
         const now = new Date();
         const lockedUntil = new Date(now.getTime() + CREATE_LEASE_MS);
-        const parcel = { weightGrams: input.weightGrams ?? null, lengthCm: input.lengthCm ?? null, widthCm: input.widthCm ?? null, heightCm: input.heightCm ?? null };
+        // What the admin entered now wins; otherwise the parcel already recorded (an automatic booking's packed unit).
+        const parcel = {
+          weightGrams: input.weightGrams ?? existing?.weightGrams ?? null,
+          lengthCm: input.lengthCm ?? existing?.lengthCm ?? null,
+          widthCm: input.widthCm ?? existing?.widthCm ?? null,
+          heightCm: input.heightCm ?? existing?.heightCm ?? null,
+        };
         if (existing) {
           if (existing.status === "CREATING" && existing.lockedUntil && existing.lockedUntil > now) throw httpError(409, "SHIPMENT_IN_PROGRESS", "A shipment for this order is being created; try again in a minute");
-          if (existing.status !== "CREATING" && existing.status !== "CREATE_FAILED") throw httpError(409, "ORDER_NOT_SHIPPABLE", "This order's shipment can't be created again");
+          if (existing.status !== "CREATING" && existing.status !== "CREATE_FAILED" && existing.status !== "QUEUED") throw httpError(409, "ORDER_NOT_SHIPPABLE", "This order's shipment can't be created again");
           // A CREATING row whose lease ran out: that attempt may have reached Delhivery.
           const reconcile = existing.needsReconcile || existing.status === "CREATING";
-          const claimed = await tx.shipment.update({ where: { id: existing.id }, data: { status: "CREATING", lockedUntil, needsReconcile: reconcile, attempts: { increment: 1 }, ...parcel } });
-          return { shipmentId: claimed.id, attempt: claimed.attempts, reconcile, order, address };
+          const claimed = await tx.shipment.update({ where: { id: existing.id }, data: { status: "CREATING", lockedUntil, nextAttemptAt: null, needsReconcile: reconcile, attempts: { increment: 1 }, ...parcel } });
+          return { shipmentId: claimed.id, attempt: claimed.attempts, reconcile, order, address, parcel };
         }
         const created = await tx.shipment.create({ data: { orderId, providerOrderRef: orderId, status: "CREATING", attempts: 1, lockedUntil, ...parcel } });
-        return { shipmentId: created.id, attempt: 1, reconcile: false, order, address };
+        return { shipmentId: created.id, attempt: 1, reconcile: false, order, address, parcel };
       }));
       if (!claim) return orders.adminGetOrder(orderId);
 
@@ -226,8 +239,8 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
               quantity,
               totalAmount: fromMinor(toMinor(order.total)),
               shippingMode: order.shippingMethod === "express" ? "Express" : "Surface",
-              weightGrams: input.weightGrams,
-              dimensionsCm: input.lengthCm && input.widthCm && input.heightCm ? { length: input.lengthCm, width: input.widthCm, height: input.heightCm } : undefined,
+              weightGrams: claim.parcel.weightGrams ?? undefined,
+              dimensionsCm: claim.parcel.lengthCm && claim.parcel.widthCm && claim.parcel.heightCm ? { length: claim.parcel.lengthCm, width: claim.parcel.widthCm, height: claim.parcel.heightCm } : undefined,
               ewaybill: input.ewaybill,
             });
             result = { waybill: created.waybill, uploadWbn: created.uploadWbn };
@@ -262,6 +275,61 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
 
     applyTracking,
     syncShipments,
+
+    // Automatic booking, step 2 (shipment worker): books queued shipments, and retries those whose last attempt left
+    // Delhivery's outcome unknown (createForOrder then looks the order up at Delhivery before creating again). Each
+    // booking goes through createForOrder, which locks the order, re-checks the verified live payment, claims the row
+    // for a lease and fences its result, so concurrent workers or an admin pressing Retry book at most one shipment.
+    // A refusal that a retry can't fix is left CREATE_FAILED for an admin; an order that should no longer ship
+    // (refunded, cancelled, shipped by hand) has its queued booking withdrawn.
+    async bookDue(limit = BATCH) {
+      const now = new Date();
+      const due = await prisma.shipment.findMany({
+        where: {
+          autoBooked: true,
+          waybill: null,
+          attempts: { lt: AUTO_BOOKING_MAX_ATTEMPTS },
+          OR: [
+            { status: "QUEUED" },
+            { status: "CREATE_FAILED", needsReconcile: true, OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+          ],
+        },
+        orderBy: { createdAt: "asc" },
+        take: limit,
+        select: { id: true, orderId: true },
+      });
+      const tally = { due: due.length, booked: 0, retryLater: 0, needsAdmin: 0, withdrawn: 0, busy: 0 };
+      for (const row of due) {
+        try {
+          await this.createForOrder(row.orderId, {});
+          tally.booked++;
+        } catch (error) {
+          const code = (error as { code?: string }).code ?? "UNKNOWN";
+          if (code === "SHIPMENT_IN_PROGRESS") {
+            tally.busy++;
+            continue;
+          }
+          const current = await prisma.shipment.findUnique({ where: { id: row.id }, select: { status: true, attempts: true, needsReconcile: true } });
+          if (!current || current.status === "CREATING") continue;
+          if (current.status === "QUEUED" && NOT_TO_BE_BOOKED.has(code)) {
+            await prisma.shipment.updateMany({ where: { id: row.id, status: "QUEUED" }, data: { status: "CANCELLED", cancelledAt: new Date(), lastErrorCode: code, lastErrorRemark: "Automatic booking withdrawn: the order is no longer to be shipped" } });
+            tally.withdrawn++;
+          } else if (current.status === "QUEUED") {
+            // Refused before anything was sent (e.g. ADDRESS_INCOMPLETE, EWAYBILL_REQUIRED): an admin must fix it.
+            await prisma.shipment.updateMany({ where: { id: row.id, status: "QUEUED" }, data: { status: "CREATE_FAILED", needsReconcile: false, lastErrorCode: code.slice(0, 64), lastErrorRemark: error instanceof Error ? error.message.slice(0, 250) : null } });
+            tally.needsAdmin++;
+          } else if (current.needsReconcile && current.attempts < AUTO_BOOKING_MAX_ATTEMPTS) {
+            const waitMinutes = AUTO_RETRY_MINUTES[Math.min(current.attempts, AUTO_RETRY_MINUTES.length) - 1];
+            await prisma.shipment.updateMany({ where: { id: row.id, status: "CREATE_FAILED" }, data: { nextAttemptAt: new Date(Date.now() + waitMinutes * 60_000) } });
+            tally.retryLater++;
+          } else {
+            tally.needsAdmin++;
+          }
+          options.log?.warn({ shipmentId: row.id, orderId: row.orderId, err: { code } }, "Automatic courier booking did not complete");
+        }
+      }
+      return tally;
+    },
 
     async syncOrder(orderId: string) {
       const shipment = await prisma.shipment.findUnique({ where: { orderId } });

@@ -10,6 +10,8 @@ import "dotenv/config";
 //   DELHIVERY_WEBHOOK_SECRET   secret, 32+ characters: the bearer token Delhivery's scan push must send.
 //   DELHIVERY_SELLER_GST_TIN, DELHIVERY_HSN_CODE   optional; sent with every shipment when set.
 //   DELHIVERY_TIMEOUT_MS       optional, 2000-60000 (default 15000).
+//   DELHIVERY_AUTO_BOOKING     "true" books a Delhivery shipment automatically once a live payment is verified (the
+//                              shipment worker does the booking). Needs DELHIVERY_ENABLED too; off = admins book.
 
 export const DELHIVERY_HOSTS = {
   staging: "https://staging-express.delhivery.com",
@@ -37,6 +39,10 @@ function unavailable(code: "SHIPPING_DISABLED" | "DELHIVERY_NOT_CONFIGURED", mes
 
 export function shippingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.DELHIVERY_ENABLED?.trim() === "true";
+}
+
+export function autoBookingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return shippingEnabled(env) && env.DELHIVERY_AUTO_BOOKING?.trim() === "true";
 }
 
 function setting(env: NodeJS.ProcessEnv, name: string): string | null {
