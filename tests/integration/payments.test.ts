@@ -691,6 +691,9 @@ test("a refund counts only once Razorpay processes it: a pending refund leaves t
     await shop.webhook("refund.failed", { refund: { entity: { id: refundId, payment_id: paymentId, amount: opened.amount, status: "failed" } } });
     row = await shop.order(placed.order.id);
     assert.deepEqual([row.paymentStatus, row.payments[0].status, row.payments[0].lastErrorCode], ["PAID", "CAPTURED", "REFUND_FAILED"]);
+    const admin = await shop.admin();
+    const attention = (await shop.app.inject({ method: "GET", url: "/api/v1/admin/payments?attention=true&limit=100", headers: admin })).json().data as { id: string }[];
+    assert.ok(attention.some((p) => p.id === row.payments[0].id), "a failed refund is listed for a person");
 
     // A second refund that is processed: now the order is refunded and cancelled, stock released.
     const retried = gateway.refund(paymentId, opened.amount, "pending");

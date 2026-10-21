@@ -446,8 +446,13 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
 
     // ---- admin ------------------------------------------------------------------------------------------------
 
-    async adminListPayments(query: { needsReview?: boolean; status?: PaymentStatus; page: number; limit: number }) {
-      const where: Prisma.PaymentWhereInput = { ...(query.needsReview !== undefined ? { needsReview: query.needsReview } : {}), ...(query.status ? { status: query.status } : {}) };
+    // `attention`: payments a person must act on (money flagged for review, or a refund Razorpay reported failed).
+    async adminListPayments(query: { needsReview?: boolean; attention?: boolean; status?: PaymentStatus; page: number; limit: number }) {
+      const where: Prisma.PaymentWhereInput = {
+        ...(query.needsReview !== undefined ? { needsReview: query.needsReview } : {}),
+        ...(query.status ? { status: query.status } : {}),
+        ...(query.attention ? { OR: [{ needsReview: true }, { lastErrorCode: "REFUND_FAILED" }] } : {}),
+      };
       const [data, total] = await prisma.$transaction([
         prisma.payment.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "desc" }], skip: (query.page - 1) * query.limit, take: query.limit }),
         prisma.payment.count({ where }),

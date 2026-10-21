@@ -23,6 +23,7 @@ const adminQuery = {
     page: { type: "integer", minimum: 1, default: 1 },
     limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
     needsReview: { type: "boolean" },
+    attention: { type: "boolean" },
     status: { type: "string", enum: ["CREATED", "FAILED", "AUTHORIZED", "CAPTURED", "PARTIALLY_REFUNDED", "REFUNDED"] },
   },
 };
@@ -52,7 +53,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
 
   app.get("/api/v1/admin/payments", { schema: routeSchema(["Admin", "Payments"], "List payments (e.g. ?needsReview=true for money that needs a person)", { security: bearer, querystring: adminQuery }) }, async (request) => {
     await request.requireAdmin();
-    const q = request.query as { page: number; limit: number; needsReview?: boolean; status?: never };
+    const q = request.query as { page: number; limit: number; needsReview?: boolean; attention?: boolean; status?: never };
     const { data, total } = await service.adminListPayments(q);
     return { success: true, data, meta: pageMeta(q.page, q.limit, total) };
   });
