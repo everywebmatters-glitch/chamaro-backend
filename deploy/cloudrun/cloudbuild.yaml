@@ -32,7 +32,7 @@ steps:
       - ${_REPO}/chamaro-api:${_TAG}
       - -c
       - >-
-        test -f dist/src/server.js && test -f dist/src/scripts/email-outbox-worker.js && test -f dist/generated/prisma/client.js
+        test -f dist/src/server.js && test -f dist/src/scripts/email-outbox-worker.js && test -f dist/src/scripts/payment-worker.js && test -f dist/generated/prisma/client.js
         && test ! -e .env && test ! -d src && test ! -d tests
         && node -e 'const s=new Intl.DateTimeFormat("en-IN",{timeZone:"Asia/Kolkata",hour:"numeric",minute:"2-digit",hour12:true}).format(new Date("2026-10-18T10:00:00Z"));if(s!=="3:30 pm"){console.error("IST formatting:",s);process.exit(1)}'
         && echo runtime image contents OK

@@ -83,6 +83,9 @@ export const env = {
   get ADMIN_BASE_URL() { return siteBaseUrl("ADMIN_BASE_URL", "https://admin.chamaro.com", "http://localhost:3001"); },
   // How long a password-reset link works for. Each link also works only once.
   PASSWORD_RESET_TOKEN_TTL_MINUTES: minutesSetting("PASSWORD_RESET_TOKEN_TTL_MINUTES", 30, 5, 120),
+  // How long a placed order may stay unpaid before the payment worker cancels it and releases its stock. Long enough
+  // for slow UPI and bank flows; the worker reads the order's payments back from Razorpay before cancelling.
+  ORDER_PAYMENT_TTL_MINUTES: minutesSetting("ORDER_PAYMENT_TTL_MINUTES", 60, 15, 24 * 60),
   get GOOGLE_CLIENT_ID() { return required("GOOGLE_CLIENT_ID"); },
   get GOOGLE_CLIENT_SECRET() { return required("GOOGLE_CLIENT_SECRET"); },
   // Backend callback registered with Google, e.g. http://localhost:4000/api/v1/auth/google/callback

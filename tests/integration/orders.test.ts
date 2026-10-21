@@ -95,6 +95,7 @@ class Shop {
   async cleanup() {
     const { prisma } = this.app;
     const customers = await prisma.customer.findMany({ where: { userId: { in: this.userIds } }, select: { id: true } }).catch(() => []);
+    await prisma.payment.deleteMany({ where: { order: { customerId: { in: customers.map((c) => c.id) } } } }).catch(() => undefined);
     await prisma.retailOrder.deleteMany({ where: { customerId: { in: customers.map((c) => c.id) } } }).catch(() => undefined);
     await prisma.product.deleteMany({ where: { id: { in: this.productIds } } }).catch(() => undefined);
     if (this.categoryId) await prisma.category.delete({ where: { id: this.categoryId } }).catch(() => undefined);
@@ -116,8 +117,11 @@ function notificationsFor(app: App, orderId: string) {
 }
 
 // Stands in for a verified payment-provider confirmation, which the API has no way to record yet. Test database only.
+// The payment is recorded the way payment.service records a captured live Razorpay payment: shipping checks for one.
 async function markPaid(app: App, orderId: string) {
-  await app.prisma.retailOrder.update({ where: { id: orderId }, data: { paymentStatus: "PAID" } });
+  const order = await app.prisma.retailOrder.update({ where: { id: orderId }, data: { paymentStatus: "PAID" } });
+  const amountMinor = Math.round(Number(order.total) * 100);
+  await app.prisma.payment.create({ data: { orderId, mode: "live", providerOrderId: `order_${randomBytes(8).toString("hex")}`, providerPaymentId: `pay_${randomBytes(8).toString("hex")}`, amountMinor, status: "CAPTURED", capturedAt: new Date() } });
 }
 
 // ---- authorization ------------------------------------------------------------------------------------------------
