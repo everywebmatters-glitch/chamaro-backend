@@ -9,6 +9,9 @@ import { httpError } from "../shared/http.js";
 //   RAZORPAY_WEBHOOK_SECRET  the secret set on the webhook in the Razorpay dashboard (not the API secret)
 //   RAZORPAY_ALLOW_LIVE_KEYS "true" to accept rzp_live_ keys; anything else refuses them, so a live key can't be
 //                            switched on by accident while payments are still being tested
+//   Live keys are also refused outside the production runtime (APP_ENV=production, set by the API image), so a
+//   developer machine whose .env holds live keys can't create real Razorpay orders. Automated tests that use fake
+//   live-format keys set RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION=true; nothing else should.
 export type RazorpayConfig = { keyId: string; keySecret: string; webhookSecret: string; mode: "test" | "live" };
 
 const KEY_ID = /^rzp_(test|live)_[A-Za-z0-9]{6,40}$/;
@@ -27,6 +30,9 @@ export function readRazorpayConfig(env: NodeJS.ProcessEnv = process.env): Razorp
   if (webhookSecret === keySecret) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "RAZORPAY_WEBHOOK_SECRET must be the webhook's own secret, not the API key secret");
   const mode = match[1] as "test" | "live";
   if (mode === "live" && env.RAZORPAY_ALLOW_LIVE_KEYS !== "true") throw httpError(503, "PAYMENTS_LIVE_MODE_BLOCKED", "Live Razorpay keys are configured but RAZORPAY_ALLOW_LIVE_KEYS is not true");
+  if (mode === "live" && env.APP_ENV !== "production" && env.RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION !== "true") {
+    throw httpError(503, "PAYMENTS_LIVE_MODE_BLOCKED", "Live Razorpay keys are only used when APP_ENV=production");
+  }
   return { keyId, keySecret, webhookSecret, mode };
 }
 

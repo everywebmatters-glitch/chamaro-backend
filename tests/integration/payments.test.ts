@@ -555,6 +555,7 @@ test("only a genuinely paid order can be shipped: unpaid, failed, cancelled, ref
     // Paid with live keys: shipped.
     process.env.RAZORPAY_KEY_ID = "rzp_live_ChamaroFake01";
     process.env.RAZORPAY_ALLOW_LIVE_KEYS = "true";
+    process.env.RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION = "true";
     try {
       const paid = await shop.placedOrder();
       const paidOpened = await shop.openPayment(paid, paid.order.id);
@@ -565,6 +566,7 @@ test("only a genuinely paid order can be shipped: unpaid, failed, cancelled, ref
     } finally {
       process.env.RAZORPAY_KEY_ID = KEY_ID;
       delete process.env.RAZORPAY_ALLOW_LIVE_KEYS;
+      delete process.env.RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION;
     }
   }));
 
@@ -578,6 +580,7 @@ test("after switching to live keys, sandbox payments are never read back, reused
 
     process.env.RAZORPAY_KEY_ID = "rzp_live_ChamaroFake01";
     process.env.RAZORPAY_ALLOW_LIVE_KEYS = "true";
+    process.env.RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION = "true";
     try {
       gateway.calls.length = 0;
       await createPaymentService(shop.app.prisma).reconcile(500);
@@ -593,6 +596,7 @@ test("after switching to live keys, sandbox payments are never read back, reused
     } finally {
       process.env.RAZORPAY_KEY_ID = KEY_ID;
       delete process.env.RAZORPAY_ALLOW_LIVE_KEYS;
+      delete process.env.RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION;
     }
   }));
 

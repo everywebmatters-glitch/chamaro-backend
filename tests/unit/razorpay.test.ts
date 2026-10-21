@@ -16,17 +16,21 @@ const code = (run: () => unknown) => {
   }
 };
 
-test("live keys work only with RAZORPAY_ALLOW_LIVE_KEYS=true; the mode comes from the key id itself", () => {
-  assert.equal(code(() => readRazorpayConfig({ ...LIVE })), "PAYMENTS_LIVE_MODE_BLOCKED");
-  assert.equal(code(() => readRazorpayConfig({ ...LIVE, RAZORPAY_ALLOW_LIVE_KEYS: "1" })), "PAYMENTS_LIVE_MODE_BLOCKED", "only the exact value true");
-  assert.equal(readRazorpayConfig({ ...LIVE, RAZORPAY_ALLOW_LIVE_KEYS: "true" }).mode, "live");
+test("live keys work only in production with RAZORPAY_ALLOW_LIVE_KEYS=true; the mode comes from the key id itself", () => {
+  const prod = { APP_ENV: "production" };
+  assert.equal(code(() => readRazorpayConfig({ ...LIVE, ...prod })), "PAYMENTS_LIVE_MODE_BLOCKED");
+  assert.equal(code(() => readRazorpayConfig({ ...LIVE, ...prod, RAZORPAY_ALLOW_LIVE_KEYS: "1" })), "PAYMENTS_LIVE_MODE_BLOCKED", "only the exact value true");
+  assert.equal(readRazorpayConfig({ ...LIVE, ...prod, RAZORPAY_ALLOW_LIVE_KEYS: "true" }).mode, "live");
+  // A developer machine (APP_ENV=development) with live keys in .env, even with the flag, never goes live.
+  assert.equal(code(() => readRazorpayConfig({ ...LIVE, APP_ENV: "development", RAZORPAY_ALLOW_LIVE_KEYS: "true" })), "PAYMENTS_LIVE_MODE_BLOCKED");
+  assert.equal(code(() => readRazorpayConfig({ ...LIVE, RAZORPAY_ALLOW_LIVE_KEYS: "true" })), "PAYMENTS_LIVE_MODE_BLOCKED", "no APP_ENV at all");
   assert.equal(readRazorpayConfig({ ...TEST }).mode, "test");
   // The flag never turns a test key into live mode.
   assert.equal(readRazorpayConfig({ ...TEST, RAZORPAY_ALLOW_LIVE_KEYS: "true" }).mode, "test");
 });
 
 test("missing, malformed or mixed-up credentials are refused before anything is touched, without echoing them", () => {
-  const allow = { RAZORPAY_ALLOW_LIVE_KEYS: "true" };
+  const allow = { RAZORPAY_ALLOW_LIVE_KEYS: "true", APP_ENV: "production" };
   for (const [label, env] of [
     ["no key id", { ...LIVE, ...allow, RAZORPAY_KEY_ID: "" }],
     ["no key secret", { ...LIVE, ...allow, RAZORPAY_KEY_SECRET: "" }],

@@ -15,6 +15,8 @@ const TEST_KEY_ID = "rzp_test_ChamaroFake01";
 Object.assign(process.env, {
   RAZORPAY_KEY_ID: LIVE_KEY_ID,
   RAZORPAY_ALLOW_LIVE_KEYS: "true",
+  // Fake live-format keys in a test run (APP_ENV=development): the explicit test-only override.
+  RAZORPAY_ALLOW_LIVE_OUTSIDE_PRODUCTION: "true",
   RAZORPAY_KEY_SECRET: "test-only-key-secret-not-real",
   RAZORPAY_WEBHOOK_SECRET: WEBHOOK_SECRET,
   DELHIVERY_ENABLED: "true",
