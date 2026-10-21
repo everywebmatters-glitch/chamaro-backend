@@ -154,6 +154,37 @@ Money that needs a person (a second payment, a wrong amount, money for a cancell
 never applied to an order; it is listed by `GET /api/v1/admin/payments?needsReview=true` and is refunded from the
 Razorpay dashboard. Uncaptured (authorized-only) payments are returned to the customer by Razorpay itself.
 
+## Delhivery shipping (not live)
+
+Code is in place but **off**: every Delhivery route answers `503 SHIPPING_DISABLED` until `DELHIVERY_ENABLED=true`.
+Outside `APP_ENV=production` only `https://staging-express.delhivery.com` is accepted; production accepts only
+`https://track.delhivery.com`. Do not enable it until payments can mark orders `PAID` (nothing does yet).
+
+Secrets to create in Secret Manager (values from Delhivery onboarding; readable by `chamaro-backend`):
+`DELHIVERY_API_TOKEN` (the **production** token, different from staging), `DELHIVERY_PICKUP_LOCATION` (registered
+warehouse name, exact case), `DELHIVERY_WEBHOOK_SECRET` (32+ random characters, e.g. `openssl rand -base64 48`; also
+given to Delhivery as the scan-push `Authorization: Bearer ...` header). Plain settings: `DELHIVERY_ENABLED`,
+`DELHIVERY_API_BASE_URL`, optional `DELHIVERY_SELLER_GST_TIN`, `DELHIVERY_HSN_CODE`, `DELHIVERY_TIMEOUT_MS`.
+
+```sh
+for S in DELHIVERY_API_TOKEN DELHIVERY_PICKUP_LOCATION DELHIVERY_WEBHOOK_SECRET; do
+  gcloud secrets create $S --project $P --replication-policy automatic
+  # paste the value, then Ctrl-D (never put it on the command line)
+  gcloud secrets versions add $S --project $P --data-file=-
+  gcloud secrets add-iam-policy-binding $S --project $P \
+    --member serviceAccount:chamaro-backend@$P.iam.gserviceaccount.com --role roles/secretmanager.secretAccessor
+done
+# When live dispatch is approved (a new revision, no traffic first, as in "Each release"):
+gcloud run deploy chamaro-api --project $P --region $R --image $REPO/chamaro-api:$TAG --no-traffic --tag c$TAG \
+  --update-env-vars DELHIVERY_ENABLED=true,DELHIVERY_API_BASE_URL=https://track.delhivery.com \
+  --update-secrets DELHIVERY_API_TOKEN=DELHIVERY_API_TOKEN:latest,DELHIVERY_PICKUP_LOCATION=DELHIVERY_PICKUP_LOCATION:latest,DELHIVERY_WEBHOOK_SECRET=DELHIVERY_WEBHOOK_SECRET:latest
+```
+
+Migration `0012_delhivery_shipments` is additive (three new tables). Tracking is read by the
+`chamaro-shipment-tracking` job (`deploy/cloudrun/shipment-tracking-job.yaml`, every 15 minutes is ample) and, for
+each scan Delhivery pushes, by `POST /api/v1/webhooks/delhivery/scans` (Delhivery sets the push up on request; the
+body is only used to pick which AWB to re-read from the tracking API).
+
 ## Notes
 
 - Swagger (`/docs`) is off in production. `/health` does not touch the database.

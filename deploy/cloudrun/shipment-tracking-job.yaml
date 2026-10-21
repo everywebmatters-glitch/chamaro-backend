@@ -1,0 +1,74 @@
+# NOT DEPLOYED. Cloud Run job that reads Delhivery tracking for shipments still moving: one pass of
+# src/scripts/shipment-tracking-worker.ts, then exit. Same image, service account and Cloud SQL connection as the API.
+# Create it only after the Delhivery secrets below exist in Secret Manager (see README.md, "Delhivery shipping"):
+#   sed "s/<TAG>/$TAG/" deploy/cloudrun/shipment-tracking-job.yaml > /tmp/shipment-tracking-job.yaml
+#   gcloud run jobs replace /tmp/shipment-tracking-job.yaml --region asia-south1
+#
+# What it may change: Shipment and ShipmentEvent rows, the order's shipped/completed status, and EmailNotification rows
+# (the shipped/delivered emails, at most once each per order). Every change comes from Delhivery's tracking API.
+# Overlapping executions are safe (each shipment is updated under a row lock; emails are keyed per order and event).
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: chamaro-shipment-tracking
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+          maxRetries: 0
+          timeoutSeconds: 600
+          containers:
+            - name: shipment-tracking
+              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-api:<TAG>
+              command: ["node"]
+              args: ["dist/src/scripts/shipment-tracking-worker.js"]
+              env:
+                - name: APP_BASE_URL
+                  value: https://chamaro.com
+                # Set to "true" only when live dispatch is approved; while false the job exits without doing anything.
+                - name: DELHIVERY_ENABLED
+                  value: "false"
+                - name: DELHIVERY_API_BASE_URL
+                  value: https://track.delhivery.com
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: DATABASE_URL
+                      key: latest
+                - name: DELHIVERY_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: DELHIVERY_API_TOKEN
+                      key: latest
+                - name: DELHIVERY_PICKUP_LOCATION
+                  valueFrom:
+                    secretKeyRef:
+                      name: DELHIVERY_PICKUP_LOCATION
+                      key: latest
+                - name: RESEND_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: RESEND_API_KEY
+                      key: latest
+                - name: RESEND_FROM_EMAIL
+                  valueFrom:
+                    secretKeyRef:
+                      name: RESEND_FROM_EMAIL_DOMAIN
+                      key: "1"
+                # config/env.ts requires CORS_ORIGIN at startup under APP_ENV=production.
+                - name: CORS_ORIGIN
+                  valueFrom:
+                    secretKeyRef:
+                      name: CORS_ORIGIN
+                      key: latest
+              resources:
+                limits:
+                  cpu: 1000m
+                  memory: 512Mi

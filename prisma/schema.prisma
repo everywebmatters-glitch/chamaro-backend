@@ -416,7 +416,8 @@ model RetailOrder {
   note                    String?             @db.Text
   // Client-chosen key (Idempotency-Key header): a retried request returns the order it already created.
   idempotencyKey          String?             @db.VarChar(64)
-  // Set together when an admin marks the order SHIPPED. Entered by hand; no shipping-provider integration yet.
+  // Either entered by hand when an admin marks the order SHIPPED, or (Delhivery) carrier and AWB set when the courier
+  // accepts the shipment and shippedAt set from the courier's first verified post-pickup scan. See model Shipment.
   carrier                 String?             @db.VarChar(64)
   trackingNumber          String?             @db.VarChar(128)
   shippedAt               DateTime?
@@ -427,6 +428,7 @@ model RetailOrder {
   items                   RetailOrderItem[]
   emailNotifications      EmailNotification[]
   payments                Payment[]
+  shipment                Shipment?
   createdAt               DateTime            @default(now())
   updatedAt               DateTime            @updatedAt
 
@@ -520,6 +522,108 @@ model RetailOrderItem {
   @@index([orderId])
   @@index([productId])
   @@index([variantId])
+}
+
+// ---------------------------------------------------------------------------
+// Courier shipments (Delhivery). Every state here comes from Delhivery's authenticated API responses; nothing a browser
+// or a webhook body says is stored as a status.
+// ---------------------------------------------------------------------------
+
+// CREATING: a create call holds the row until lockedUntil. CREATE_FAILED: Delhivery did not (or may not) have created
+// it; needsReconcile says whether the next attempt must first look the order up at Delhivery. MANIFESTED onwards
+// follow Delhivery's tracking status (StatusType/Status); DELIVERED, RETURNED and CANCELLED are final.
+enum ShipmentStatus {
+  CREATING
+  CREATE_FAILED
+  MANIFESTED
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  RETURN_IN_TRANSIT
+  RETURNED
+  CANCELLED
+}
+
+// One courier shipment per order (orderId is unique), so a retried or concurrent create can never make a second one.
+// providerOrderRef is the `order` value sent to Delhivery (the order id), which Delhivery also refuses to accept twice.
+model Shipment {
+  id                     String          @id @default(cuid())
+  orderId                String          @unique
+  provider               String          @default("DELHIVERY") @db.VarChar(32)
+  status                 ShipmentStatus  @default(CREATING)
+  // The AWB Delhivery assigned. NULL until Delhivery confirms the shipment.
+  waybill                String?         @unique @db.VarChar(64)
+  providerOrderRef       String          @db.VarChar(64)
+  uploadWbn              String?         @db.VarChar(64)
+  // Delhivery's own status text, type (UD/DL/RT/...), time and location, as last read from its tracking API.
+  providerStatus         String?         @db.VarChar(64)
+  providerStatusType     String?         @db.VarChar(16)
+  providerStatusAt       DateTime?
+  providerStatusLocation String?         @db.VarChar(191)
+  // Only set if Delhivery's API returns one; no URL is built from guesses.
+  trackingUrl            String?         @db.VarChar(2048)
+  attempts               Int             @default(0)
+  lockedUntil            DateTime?
+  needsReconcile         Boolean         @default(false)
+  // A fixed error code, plus Delhivery's short remark (e.g. "Duplicate order id"). Admin only; never a token.
+  lastErrorCode          String?         @db.VarChar(64)
+  lastErrorRemark        String?         @db.VarChar(255)
+  weightGrams            Int?
+  lengthCm               Int?
+  widthCm                Int?
+  heightCm               Int?
+  manifestedAt           DateTime?
+  pickedUpAt             DateTime?
+  deliveredAt            DateTime?
+  cancelledAt            DateTime?
+  lastSyncedAt           DateTime?
+  order                  RetailOrder     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  events                 ShipmentEvent[]
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
+
+  @@index([status, lastSyncedAt])
+}
+
+// One courier scan, copied from Delhivery's tracking API. eventKey is a hash of the scan's own fields, so reading the
+// same scan again (a later sync, a repeated webhook) never records it twice.
+model ShipmentEvent {
+  id           String   @id @default(cuid())
+  shipmentId   String
+  eventKey     String   @unique @db.Char(64)
+  status       String   @db.VarChar(64)
+  statusType   String?  @db.VarChar(16)
+  location     String?  @db.VarChar(191)
+  instructions String?  @db.VarChar(500)
+  occurredAt   DateTime
+  shipment     Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now())
+
+  @@index([shipmentId, occurredAt])
+}
+
+enum ShipmentPickupStatus {
+  REQUESTING
+  REQUESTED
+  FAILED
+  OUTCOME_UNKNOWN
+}
+
+// A Delhivery pickup request for one warehouse and day. Unique per (location, date), so a retry cannot book twice.
+model ShipmentPickupRequest {
+  id                   String               @id @default(cuid())
+  pickupLocation       String               @db.VarChar(191)
+  pickupDate           String               @db.VarChar(10)
+  pickupTime           String               @db.VarChar(8)
+  expectedPackageCount Int
+  status               ShipmentPickupStatus @default(REQUESTING)
+  providerPickupId     String?              @db.VarChar(64)
+  lastErrorCode        String?              @db.VarChar(64)
+  lastErrorRemark      String?              @db.VarChar(255)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  @@unique([pickupLocation, pickupDate])
 }
 
 // ---------------------------------------------------------------------------

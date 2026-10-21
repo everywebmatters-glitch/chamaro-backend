@@ -22,6 +22,9 @@ export function readRazorpayConfig(env: NodeJS.ProcessEnv = process.env): Razorp
   if (!keyId || !keySecret || !webhookSecret) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "Online payment is not available right now");
   const match = KEY_ID.exec(keyId);
   if (!match) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "RAZORPAY_KEY_ID is not a Razorpay key id");
+  // Copy-paste mistakes that would otherwise surface as signature failures on real payments.
+  if (/\s/.test(keySecret) || /\s/.test(webhookSecret)) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "RAZORPAY_KEY_SECRET or RAZORPAY_WEBHOOK_SECRET contains whitespace");
+  if (webhookSecret === keySecret) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "RAZORPAY_WEBHOOK_SECRET must be the webhook's own secret, not the API key secret");
   const mode = match[1] as "test" | "live";
   if (mode === "live" && env.RAZORPAY_ALLOW_LIVE_KEYS !== "true") throw httpError(503, "PAYMENTS_LIVE_MODE_BLOCKED", "Live Razorpay keys are configured but RAZORPAY_ALLOW_LIVE_KEYS is not true");
   return { keyId, keySecret, webhookSecret, mode };
@@ -30,6 +33,6 @@ export function readRazorpayConfig(env: NodeJS.ProcessEnv = process.env): Razorp
 // The webhook secret alone, for the webhook route: it must work even if the API keys are being rotated.
 export function readWebhookSecret(env: NodeJS.ProcessEnv = process.env): string {
   const secret = env.RAZORPAY_WEBHOOK_SECRET?.trim();
-  if (!secret) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "Payment webhooks are not configured");
+  if (!secret || /\s/.test(secret)) throw httpError(503, "PAYMENTS_NOT_CONFIGURED", "Payment webhooks are not configured");
   return secret;
 }

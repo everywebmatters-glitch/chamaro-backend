@@ -39,10 +39,32 @@ export async function retryOnConflict<T>(run: () => Promise<T>, attempts = 4): P
   }
 }
 
-const orderInclude = { items: { orderBy: { id: "asc" as const } } } satisfies Prisma.RetailOrderInclude;
+const shipmentInclude = { events: { orderBy: [{ occurredAt: "desc" as const }, { id: "desc" as const }] } } satisfies Prisma.ShipmentInclude;
+export const orderInclude = { items: { orderBy: { id: "asc" as const } }, shipment: { include: shipmentInclude } } satisfies Prisma.RetailOrderInclude;
 const adminOrderInclude = { ...orderInclude, customer: { select: { id: true, customerType: true, user: { select: { id: true, name: true, email: true } } } } } satisfies Prisma.RetailOrderInclude;
 
 type OrderRow = Prisma.RetailOrderGetPayload<{ include: typeof orderInclude }>;
+type ShipmentRow = Prisma.ShipmentGetPayload<{ include: typeof shipmentInclude }>;
+
+// What a customer may see of a courier shipment: the courier, the real AWB and the courier's own tracking, nothing
+// about attempts, errors or internal references. A shipment Delhivery has not confirmed (no AWB yet) is not shown.
+export function customerShipment(shipment: ShipmentRow | null) {
+  if (!shipment?.waybill) return null;
+  return {
+    courier: "Delhivery",
+    trackingNumber: shipment.waybill,
+    trackingUrl: shipment.trackingUrl,
+    status: shipment.status,
+    courierStatus: shipment.providerStatus,
+    courierStatusLocation: shipment.providerStatusLocation,
+    courierStatusAt: shipment.providerStatusAt,
+    pickedUpAt: shipment.pickedUpAt,
+    deliveredAt: shipment.deliveredAt,
+    cancelledAt: shipment.cancelledAt,
+    lastCheckedAt: shipment.lastSyncedAt,
+    events: shipment.events.map((event) => ({ status: event.status, location: event.location, instructions: event.instructions, occurredAt: event.occurredAt })),
+  };
+}
 
 // Orders an admin may mark as shipped. COMPLETED and CANCELLED are final; SHIPPED is handled separately.
 const SHIPPABLE_STATUSES = new Set(["PENDING", "CONFIRMED", "PROCESSING"]);
@@ -50,11 +72,13 @@ const SHIPPABLE_STATUSES = new Set(["PENDING", "CONFIRMED", "PROCESSING"]);
 // provider confirmation may set (services/payment.service.ts, after reading the payment back from Razorpay). The
 // fulfilment status (PENDING/CONFIRMED/PROCESSING) never implies payment.
 
-export function presentOrder<T extends OrderRow>(order: T) {
-  const { shippingAddressSnapshot, ...rest } = order;
+// Customers get customerShipment(); admins get the whole shipment row (it holds no credential).
+export function presentOrder<T extends OrderRow>(order: T, audience: "customer" | "admin" = "customer") {
+  const { shippingAddressSnapshot, shipment, ...rest } = order;
   const money = (value: { toString(): string }) => fromMinor(toMinor(value));
   return {
     ...rest,
+    shipment: audience === "admin" ? shipment : customerShipment(shipment),
     subtotal: money(order.subtotal),
     shippingTotal: money(order.shippingTotal),
     total: money(order.total),
@@ -75,11 +99,11 @@ export function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddres
 
 // Records one customer email about an order, inside the order's transaction. The recipient is the order's account
 // holder, read in the same transaction; an address they never verified is recorded as skipped, not sent.
-// The eventKey ("order:<id>:cancelled") is the same whichever path cancels the order (the customer, or the payment
-// time limit running out), so an order is announced as cancelled once.
-export async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: string, orderId: string, event: "placed" | "confirmed" | "shipped" | "cancelled", render: (customerName: string) => EmailMessage) {
+// The eventKey ("order:<id>:<event>") is the same whichever path reports the event (the customer or the payment time
+// limit for "cancelled"; an admin or the courier's tracking for "shipped"), so each is announced once.
+export async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: string, orderId: string, event: "placed" | "confirmed" | "shipped" | "delivered" | "cancelled", render: (customerName: string) => EmailMessage) {
   const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { id: true, name: true, email: true, emailVerifiedAt: true } });
-  const kinds: Record<typeof event, NotificationKind> = { placed: "ORDER_PLACED", confirmed: "ORDER_CONFIRMED", shipped: "ORDER_SHIPPED", cancelled: "ORDER_CANCELLED" };
+  const kinds: Record<typeof event, NotificationKind> = { placed: "ORDER_PLACED", confirmed: "ORDER_CONFIRMED", shipped: "ORDER_SHIPPED", delivered: "ORDER_DELIVERED", cancelled: "ORDER_CANCELLED" };
   const kind = kinds[event];
   return enqueueNotification(tx, {
     eventKey: `order:${orderId}:${event}`,
@@ -288,7 +312,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         prisma.retailOrder.findMany({ where, include: orderInclude, orderBy: [{ createdAt: "desc" }, { id: "desc" }], skip: (page - 1) * limit, take: limit }),
         prisma.retailOrder.count({ where }),
       ]);
-      return { data: rows.map(presentOrder), meta: pageMeta(page, limit, total) };
+      return { data: rows.map((row) => presentOrder(row)), meta: pageMeta(page, limit, total) };
     },
 
     // Someone else's order is reported as not found, so order ids can't be probed.
@@ -338,17 +362,19 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         prisma.retailOrder.findMany({ where, include: adminOrderInclude, orderBy: [{ createdAt: "desc" }, { id: "desc" }], skip: (query.page - 1) * query.limit, take: query.limit }),
         prisma.retailOrder.count({ where }),
       ]);
-      return { data: rows.map(presentOrder), meta: pageMeta(query.page, query.limit, total) };
+      return { data: rows.map((row) => presentOrder(row, "admin")), meta: pageMeta(query.page, query.limit, total) };
     },
 
     // Marks an order SHIPPED with the carrier and tracking number an admin entered by hand, then emails the
     // customer. Repeating the same request returns the order without a second email; a different tracking number
-    // for an order that has already shipped is refused. No shipping-provider API is called.
+    // for an order that has already shipped is refused. No shipping-provider API is called. An order with a courier
+    // (Delhivery) shipment is refused: its shipped state comes only from the courier's tracking.
     async adminShipOrder(orderId: string, input: { carrier: string; trackingNumber: string }) {
       const result = await retryOnConflict(() => prisma.$transaction(async (tx) => {
         const locked = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM RetailOrder WHERE id = ${orderId} FOR UPDATE`;
         if (locked.length === 0) throw httpError(404, "NOT_FOUND", "Order not found");
         const order = await tx.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: adminOrderInclude });
+        if (order.shipment) throw httpError(409, "SHIPMENT_MANAGED_BY_COURIER", "This order has a Delhivery shipment; its status comes from Delhivery tracking");
         if (order.status === "SHIPPED") {
           if (order.carrier === input.carrier && order.trackingNumber === input.trackingNumber) return { order, notification: null };
           throw httpError(409, "ORDER_ALREADY_SHIPPED", "This order has already been marked as shipped");
@@ -371,13 +397,13 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
       }));
 
       await outbox.dispatch(result.notification);
-      return presentOrder(result.order);
+      return presentOrder(result.order, "admin");
     },
 
     async adminGetOrder(orderId: string) {
       const order = await prisma.retailOrder.findUnique({ where: { id: orderId }, include: adminOrderInclude });
       if (!order) throw httpError(404, "NOT_FOUND", "Order not found");
-      return presentOrder(order);
+      return presentOrder(order, "admin");
     },
   };
 }

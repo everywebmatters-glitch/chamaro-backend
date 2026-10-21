@@ -196,7 +196,9 @@ export type OrderEmail = {
   shippingMethod: string | null;
   shippingAddress: OrderEmailAddress | null;
 };
-export type ShipmentEmail = Pick<OrderEmail, "id" | "customerName" | "items" | "shippingAddress"> & { carrier: string; trackingNumber: string; shippedAt: Date };
+// `orderUrl` (the customer's order page, with its tracking timeline) is given for courier-tracked shipments.
+export type ShipmentEmail = Pick<OrderEmail, "id" | "customerName" | "items" | "shippingAddress"> & { carrier: string; trackingNumber: string; shippedAt: Date; orderUrl?: string };
+export type DeliveryEmail = Pick<OrderEmail, "id" | "customerName" | "items" | "shippingAddress"> & { carrier: string; trackingNumber: string; deliveredAt: Date; orderUrl: string };
 export type CancellationEmail = Pick<OrderEmail, "id" | "customerName" | "items" | "total"> & { cancelledAt: Date };
 
 const rupees = (amount: string) => `&#8377;${escapeHtml(amount)}`;
@@ -294,17 +296,44 @@ export function shipmentEmail(shipment: ShipmentEmail): EmailMessage {
         ${row("Shipped", formatIstDate(shipment.shippedAt))}`)}
       ${table(itemRows(shipment.items))}
       ${addressBlock(shipment.shippingAddress)}
-      <p style="${MUTED}">Use the tracking number on the carrier's website to follow your delivery.</p>
+      ${shipment.orderUrl ? `<a href="${escapeHtml(shipment.orderUrl)}" style="${BUTTON}">Track your order</a>` : `<p style="${MUTED}">Use the tracking number on the carrier's website to follow your delivery.</p>`}
       <p style="${LAST}">Questions about your delivery? Contact us at ${contactHtml()} and quote your order reference.</p>`),
     text: textLayout([
       `Hi ${shipment.customerName}, your order ${shipment.id} is on its way.`,
       `Carrier: ${shipment.carrier}\nTracking number: ${shipment.trackingNumber}\nShipped: ${formatIstDate(shipment.shippedAt)}`,
       itemLines(shipment.items),
       addressText(shipment.shippingAddress),
-      "Use the tracking number on the carrier's website to follow your delivery.",
+      shipment.orderUrl ? `Track your order: ${shipment.orderUrl}` : "Use the tracking number on the carrier's website to follow your delivery.",
       `Questions about your delivery? Contact us at ${contactUrl()} and quote your order reference.`,
     ]),
   };
+}
+
+// Sent only when the courier's own tracking reports the package delivered.
+export function deliveryEmail(delivery: DeliveryEmail): EmailMessage {
+  return {
+    subject: `Your Chamaro order ${delivery.id} has been delivered`,
+    html: layout(`<p style="${TEXT}">Hi ${escapeHtml(delivery.customerName)}, ${escapeHtml(delivery.carrier)} reports that your order ${escapeHtml(delivery.id)} was delivered on ${formatIstDate(delivery.deliveredAt)}.</p>
+      ${table(`${row("Carrier", escapeHtml(delivery.carrier))}
+        ${row("Tracking number", `<strong>${escapeHtml(delivery.trackingNumber)}</strong>`)}`)}
+      ${table(itemRows(delivery.items))}
+      ${addressBlock(delivery.shippingAddress)}
+      <a href="${escapeHtml(delivery.orderUrl)}" style="${BUTTON}">View your order</a>
+      <p style="${LAST}">Didn't receive it, or something isn't right? Contact us at ${contactHtml()} and quote your order reference.</p>`),
+    text: textLayout([
+      `Hi ${delivery.customerName}, ${delivery.carrier} reports that your order ${delivery.id} was delivered on ${formatIstDate(delivery.deliveredAt)}.`,
+      `Carrier: ${delivery.carrier}\nTracking number: ${delivery.trackingNumber}`,
+      itemLines(delivery.items),
+      addressText(delivery.shippingAddress),
+      `View your order: ${delivery.orderUrl}`,
+      `Didn't receive it, or something isn't right? Contact us at ${contactUrl()} and quote your order reference.`,
+    ]),
+  };
+}
+
+// The customer's own order page on the storefront (it requires their sign-in).
+export function orderPageUrl(orderId: string): string {
+  return `${env.APP_BASE_URL}/account/orders/${encodeURIComponent(orderId)}/`;
 }
 
 // Only unpaid orders are cancelled this way (by the customer, see order.service cancelOrder, or because payment was

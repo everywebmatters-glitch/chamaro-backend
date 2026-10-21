@@ -18,7 +18,7 @@ import { deliverEmail, type EmailMessage, type EmailProviderFailure } from "./em
 //  - nothing secret: only the provider's error name and HTTP status are stored or logged, never its message, and
 //    log lines carry ids, never the recipient's address.
 
-export type NotificationKind = "ORDER_PLACED" | "ORDER_CONFIRMED" | "ORDER_SHIPPED" | "ORDER_CANCELLED" | "PASSWORD_CHANGED" | "OUTBOX_SELF_TEST";
+export type NotificationKind = "ORDER_PLACED" | "ORDER_CONFIRMED" | "ORDER_SHIPPED" | "ORDER_DELIVERED" | "ORDER_CANCELLED" | "PASSWORD_CHANGED" | "OUTBOX_SELF_TEST";
 
 export const OUTBOX_SETTINGS = {
   MAX_ATTEMPTS: 5,

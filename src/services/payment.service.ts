@@ -18,7 +18,7 @@ import { toMinor } from "../shared/order-pricing.js";
 import { createCheckoutService } from "./checkout.service.js";
 import { orderCancelledEmail, orderConfirmedEmail } from "./email.service.js";
 import { createEmailOutbox, type QueuedNotification } from "./email-outbox.service.js";
-import { emailParts, enqueueOrderEmail, presentOrder, releaseReservation, retryOnConflict } from "./order.service.js";
+import { emailParts, enqueueOrderEmail, orderInclude, presentOrder, releaseReservation, retryOnConflict } from "./order.service.js";
 
 // Razorpay payments for retail orders. Rules that protect the money and the data:
 //  - the amount is always the order's stored total (computed on the server when the order was placed); a gateway
@@ -55,7 +55,7 @@ export const EXPIRY_GRACE_MS = 15 * 60_000;
 export type PaymentOutcome = "paid" | "already_paid" | "pending" | "failed" | "review" | "refunded" | "ignored";
 type Applied = { outcome: PaymentOutcome; orderId: string | null; capture: { paymentId: string; amountMinor: number } | null; notification: QueuedNotification | null };
 
-const orderWithItems = { items: { orderBy: { id: "asc" as const } }, customer: { select: { userId: true } } } satisfies Prisma.RetailOrderInclude;
+const orderWithItems = { ...orderInclude, customer: { select: { userId: true } } } satisfies Prisma.RetailOrderInclude;
 
 // The status a payment moves to from Razorpay's answer, never backwards.
 function nextStatus(current: PaymentStatus, remote: RemotePayment): PaymentStatus {
@@ -301,7 +301,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
       const remote = await gateway.fetchPayment(body.razorpayPaymentId).catch(gatewayError);
       if (remote.orderId !== body.razorpayOrderId) throw httpError(400, "PAYMENT_SIGNATURE_INVALID", "This payment could not be verified");
       const result = await settle(gateway, remote).catch(gatewayError);
-      const order = await prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: { items: { orderBy: { id: "asc" } } } });
+      const order = await prisma.retailOrder.findUniqueOrThrow({ where: { id: orderId }, include: orderInclude });
       return { outcome: result.outcome, order: presentOrder(order) };
     },
 
@@ -414,7 +414,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
             if (order.payments.some((payment) => RANK[payment.status] > 0 && payment.mode === "live")) return null; // money moved: leave it to reconcile/review
             if (order.payments.some((payment) => RANK[payment.status] > 0 && payment.mode === mode)) return null;
             await releaseReservation(tx, order.items);
-            const cancelled = presentOrder(await tx.retailOrder.update({ where: { id: order.id }, data: { status: "CANCELLED" }, include: { items: { orderBy: { id: "asc" } } } }));
+            const cancelled = presentOrder(await tx.retailOrder.update({ where: { id: order.id }, data: { status: "CANCELLED" }, include: orderInclude }));
             return enqueueOrderEmail(tx, order.customer.userId, order.id, "cancelled", (customerName) =>
               orderCancelledEmail({ id: cancelled.id, customerName, items: emailParts(cancelled).items, total: cancelled.total, cancelledAt: cancelled.updatedAt, reason: "payment_expired" }),
             );
