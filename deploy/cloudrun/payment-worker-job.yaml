@@ -7,6 +7,8 @@
 #   gcloud run jobs replace /tmp/payment-worker-job.yaml --region asia-south1
 # Cloud Scheduler (chamaro-payment-worker-every-5-min, see README.md) starts it every five minutes.
 #
+# Razorpay secrets are pinned to explicit versions (the same ones as the chamaro-api revision); update them together.
+#
 # Overlapping executions are safe: every change locks the order row, and payment states only move forward.
 apiVersion: run.googleapis.com/v1
 kind: Job
@@ -46,17 +48,17 @@ spec:
                   valueFrom:
                     secretKeyRef:
                       name: RAZORPAY_KEY_ID
-                      key: latest
+                      key: "1"
                 - name: RAZORPAY_KEY_SECRET
                   valueFrom:
                     secretKeyRef:
                       name: RAZORPAY_KEY_SECRET
-                      key: latest
+                      key: "1"
                 - name: RAZORPAY_WEBHOOK_SECRET
                   valueFrom:
                     secretKeyRef:
                       name: RAZORPAY_WEBHOOK_SECRET
-                      key: latest
+                      key: "1"
                 # Order-confirmed and expiry-cancellation emails are queued by this job and sent through the outbox.
                 - name: RESEND_API_KEY
                   valueFrom:
@@ -70,6 +72,9 @@ spec:
                       key: "1"
                 - name: APP_BASE_URL
                   value: https://chamaro.com
+                # Live keys are refused without this (and APP_ENV=production, which the image sets).
+                - name: RAZORPAY_ALLOW_LIVE_KEYS
+                  value: "true"
               resources:
                 limits:
                   cpu: 1000m
