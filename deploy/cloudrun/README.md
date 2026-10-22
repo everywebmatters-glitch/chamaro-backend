@@ -200,6 +200,11 @@ and `DELHIVERY_HSN_CODE`), `QUEUED` with `DELHIVERY_NOT_CONFIGURED` naming the s
 the first pass after the settings are fixed. A shipment flagged `BOOKED_FOR_INELIGIBLE_ORDER` was booked just as its order
 was refunded or cancelled: cancel it in Delhivery.
 
+Automatic pickup: with `DELHIVERY_AUTO_PICKUP=true` and `DELHIVERY_PICKUP_TIME=HH:MM` (Indian time) on the shipment
+worker, each pass after booking asks Delhivery to collect the booked, not yet picked-up parcels: for today if the time
+is at least 30 minutes away, else tomorrow. One request per warehouse and day; parcels booked after it wait for the next
+day's. A request whose outcome is unknown is not re-sent automatically; confirm it in Retail Orders' pickup API.
+
 Delhivery's scan-push webhook (`POST /api/v1/webhooks/delhivery/scans`) stays off (`503 SCAN_PUSH_DISABLED`) unless
 `DELHIVERY_SCAN_PUSH_ENABLED=true`. Do not set it until how Delhivery authenticates the push has been confirmed from its
 official documentation and with Delhivery; tracking is read by the shipment worker and by "Refresh tracking" in Retail

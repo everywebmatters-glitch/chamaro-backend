@@ -8,7 +8,7 @@
 // well inside Delhivery's 750 calls per 5 minutes) and applies it, recording the shipped/delivered emails exactly once.
 // With DELHIVERY_ENABLED unset it does nothing and exits successfully.
 import { createScriptPrisma } from "./prisma.js";
-import { autoBookingEnabled, shippingEnabled } from "../config/delhivery.js";
+import { autoBookingEnabled, autoPickupEnabled, shippingEnabled } from "../config/delhivery.js";
 import { createShipmentService } from "../services/shipment.service.js";
 
 // Structured lines for Cloud Logging: ids and error codes only, never addresses, tokens or response bodies.
@@ -27,6 +27,8 @@ async function run() {
     const service = createShipmentService(prisma, { log: log as never });
     // Automatic booking first (queued by verified live payments), so a new shipment is tracked in the same run.
     if (autoBookingEnabled()) log.info(await service.bookDue(), "Courier booking pass finished");
+    // Then ask Delhivery to collect what is booked (once a day, at DELHIVERY_PICKUP_TIME).
+    if (autoPickupEnabled()) log.info(await service.pickupDue(), "Courier pickup pass finished");
     for (let pass = 1; pass <= MAX_PASSES; pass++) {
       const result = await service.syncDue();
       log.info({ pass, ...result }, "Shipment tracking pass finished");

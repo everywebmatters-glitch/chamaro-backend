@@ -46,6 +46,21 @@ export function autoBookingEnabled(env: NodeJS.ProcessEnv = process.env): boolea
   return shippingEnabled(env) && env.DELHIVERY_AUTO_BOOKING?.trim() === "true";
 }
 
+// Automatic pickup request: the shipment worker asks Delhivery to collect manifested parcels once a day, at
+// DELHIVERY_PICKUP_TIME. Off unless DELHIVERY_AUTO_PICKUP=true (and shipping is enabled).
+export function autoPickupEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return shippingEnabled(env) && env.DELHIVERY_AUTO_PICKUP?.trim() === "true";
+}
+
+// The pickup time of day (Indian local time) as HH:MM:SS. Never defaulted: it is the operator's choice.
+export function readPickupTime(env: NodeJS.ProcessEnv = process.env): string {
+  const value = env.DELHIVERY_PICKUP_TIME?.trim();
+  if (!value) throw unavailable("DELHIVERY_NOT_CONFIGURED", "Automatic pickup is not configured: DELHIVERY_PICKUP_TIME is not set");
+  const match = /^([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?$/.exec(value);
+  if (!match) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_PICKUP_TIME must be HH:MM or HH:MM:SS (24-hour, Indian time)");
+  return `${match[1]}:${match[2]}:${match[3] ?? "00"}`;
+}
+
 function setting(env: NodeJS.ProcessEnv, name: string): string | null {
   const value = env[name]?.trim();
   return value ? value : null;

@@ -38,6 +38,12 @@ spec:
                 # Automatic booking after a verified live payment (needs DELHIVERY_ENABLED too). Same value as chamaro-api.
                 - name: DELHIVERY_AUTO_BOOKING
                   value: "false"
+                # Automatic pickup request: once a day the worker asks Delhivery to collect what is booked, at
+                # DELHIVERY_PICKUP_TIME (HH:MM, Indian time; the operator's choice, never defaulted).
+                - name: DELHIVERY_AUTO_PICKUP
+                  value: "false"
+                # - name: DELHIVERY_PICKUP_TIME
+                #   value: "<HH:MM>"
                 - name: DELHIVERY_API_BASE_URL
                   value: https://track.delhivery.com
                 # Required with the production host (Delhivery lists them as mandatory): the seller's own GSTIN and the

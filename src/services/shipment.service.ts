@@ -1,10 +1,11 @@
 import type { FastifyBaseLogger } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { PrismaClient, ShipmentStatus } from "../../generated/prisma/client.js";
-import { readDelhiveryConfig, readWebhookSecret } from "../config/delhivery.js";
+import { readDelhiveryConfig, readPickupTime, readWebhookSecret } from "../config/delhivery.js";
 import { createDelhiveryClient, DelhiveryError, type DelhiveryClient, type TrackedShipment } from "../providers/delhivery.provider.js";
 import { FINAL_STATES, PICKED_UP_STATES, mapDelhiveryStatus, parseDelhiveryTime, scanEventKey, type TrackedState } from "../shared/delhivery-status.js";
 import { httpError } from "../shared/http.js";
+import { pickupSlot } from "../shared/pickup-slot.js";
 import { fromMinor, toMinor } from "../shared/order-pricing.js";
 import { deliveryEmail, orderPageUrl, shipmentEmail } from "./email.service.js";
 import { createEmailOutbox, type QueuedNotification } from "./email-outbox.service.js";
@@ -356,6 +357,28 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
         }
       }
       return tally;
+    },
+
+    // Automatic pickup request (shipment worker, after booking): asks Delhivery to collect the parcels that are booked and
+    // not yet picked up, once per day at DELHIVERY_PICKUP_TIME. requestPickup keeps one request per warehouse and day, so
+    // repeated passes send nothing more. A request whose outcome is unknown is never re-sent automatically (it may have
+    // been booked): an admin confirms it. Parcels booked after the day's request wait for the next day's.
+    async pickupDue() {
+      const waiting = await prisma.shipment.count({ where: { status: "MANIFESTED", pickedUpAt: null, waybill: { not: null } } });
+      if (waiting === 0) return { waiting, requested: false, reason: "NOTHING_WAITING" };
+      const time = readPickupTime();
+      const config = readDelhiveryConfig();
+      const slot = pickupSlot(Date.now(), time);
+      const existing = await prisma.shipmentPickupRequest.findUnique({ where: { pickupLocation_pickupDate: { pickupLocation: config.pickupLocation, pickupDate: slot.date } } });
+      if (existing && existing.status !== "FAILED") return { waiting, requested: false, reason: existing.status, pickupDate: slot.date };
+      try {
+        await this.requestPickup({ pickupDate: slot.date, pickupTime: slot.time });
+        return { waiting, requested: true, pickupDate: slot.date, pickupTime: slot.time };
+      } catch (error) {
+        const code = (error as { code?: string }).code ?? "UNKNOWN";
+        options.log?.warn({ pickupDate: slot.date, err: { code } }, "Automatic pickup request did not complete");
+        return { waiting, requested: false, reason: code, pickupDate: slot.date };
+      }
     },
 
     async syncOrder(orderId: string) {
