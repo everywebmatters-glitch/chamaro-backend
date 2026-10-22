@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 
 const skipReason = await isolatedDatabaseSkipReason();
+// One test signs in many times within a minute; the exchange route is rate limited (10 per minute) in normal use.
+process.env.AUTH_RATE_LIMIT_MAX = "1000";
 const configured = Boolean(
   process.env.DATABASE_URL &&
   process.env.JWT_SECRET &&
@@ -132,12 +134,55 @@ test("Google OAuth browser flow: state, callback redirects, PKCE code exchange, 
     const againCode = fragment((await callback(`code=c&state=${againFlow.state}`, againFlow.cookie)).headers.location).get("code") as string;
     assert.equal((await exchange(againCode, again.verifier)).json().data.user.id, user.id);
 
-    // --- Linking rule preserved: an existing password account is NOT silently linked ---
-    const passwordUser = await app.prisma.user.create({ data: { name: "Password User", email: `google-password-${suffix}@example.test`, passwordHash: "existing-password", role: "CUSTOMER" } });
+    // --- A customer who registered with a password and now uses Google: Google verified the address, so it is linked ---
+    const googleSignIn = async () => {
+      const pair = pkcePair();
+      const started = await startFlow(app, pair.challenge);
+      const params = fragment((await callback(`code=c&state=${started.state}`, started.cookie)).headers.location);
+      return { error: params.get("error"), exchanged: params.get("code") ? await exchange(params.get("code") as string, pair.verifier) : null };
+    };
+    const passwordUser = await app.prisma.user.create({ data: { name: "Password User", email: `google-password-${suffix}@example.test`, passwordHash: "existing-password", emailVerifiedAt: new Date(), role: "CUSTOMER" } });
     createdUserIds.push(passwordUser.id);
-    identity = { googleId: `unlinked-${suffix}`, email: passwordUser.email, name: "Someone" };
-    const unlinked = await startFlow(app, pkcePair().challenge);
-    assert.equal(await stateError(`code=c&state=${unlinked.state}`, unlinked.cookie), "GOOGLE_ACCOUNT_NOT_LINKED");
+    identity = { googleId: `linked-${suffix}`, email: passwordUser.email, name: "Someone" };
+    const linkedSignIn = await googleSignIn();
+    assert.equal(linkedSignIn.error, null);
+    assert.equal(linkedSignIn.exchanged?.statusCode, 200);
+    assert.equal(linkedSignIn.exchanged?.json().data.user.id, passwordUser.id, "signed in to the existing account, not a new one");
+    const linkedRow = await app.prisma.user.findUniqueOrThrow({ where: { id: passwordUser.id } });
+    assert.equal(linkedRow.googleId, `linked-${suffix}`);
+    assert.equal(linkedRow.passwordHash, "existing-password", "a verified account keeps its password: both ways of signing in work");
+    assert.equal((await googleSignIn()).exchanged?.json().data.user.id, passwordUser.id, "and the next Google sign-in finds it directly");
+
+    // --- Same, but the account's own address was never verified: someone may have registered it with a password they
+    //     know, so the password is disabled and its sessions end with the link ---
+    const hijackable = await app.prisma.user.create({ data: { name: "Unverified", email: `google-unverified-${suffix}@example.test`, passwordHash: "attacker-knows-this", role: "CUSTOMER" } });
+    createdUserIds.push(hijackable.id);
+    const oldSession = await app.prisma.authSession.create({ data: { userId: hijackable.id, familyId: `fam-${suffix}`, tokenHash: "f".repeat(64), expiresAt: new Date(Date.now() + 3_600_000) } });
+    identity = { googleId: `unverified-${suffix}`, email: hijackable.email, name: "Real Owner" };
+    const takeover = await googleSignIn();
+    assert.equal(takeover.exchanged?.json().data.user.id, hijackable.id);
+    const neutralised = await app.prisma.user.findUniqueOrThrow({ where: { id: hijackable.id } });
+    assert.notEqual(neutralised.passwordHash, "attacker-knows-this", "the pre-registered password no longer works");
+    assert.ok(neutralised.emailVerifiedAt, "Google proved the address");
+    assert.ok((await app.prisma.authSession.findUniqueOrThrow({ where: { id: oldSession.id } })).revokedAt, "its sessions ended");
+
+    // --- Never linked automatically: an administrator account, or one tied to a different Google identity ---
+    const adminByEmail = await app.prisma.user.create({ data: { name: "Admin", email: `google-admin-email-${suffix}@example.test`, passwordHash: "existing-password", emailVerifiedAt: new Date(), role: "ADMIN" } });
+    createdUserIds.push(adminByEmail.id);
+    identity = { googleId: `attacker-admin-${suffix}`, email: adminByEmail.email, name: "Someone" };
+    assert.equal((await googleSignIn()).error, "GOOGLE_ACCOUNT_NOT_LINKED");
+    assert.equal((await app.prisma.user.findUniqueOrThrow({ where: { id: adminByEmail.id } })).googleId, null);
+    const otherGoogle = await app.prisma.user.create({ data: { name: "Other", email: `google-other-${suffix}@example.test`, googleId: `first-google-${suffix}`, passwordHash: "existing-password", emailVerifiedAt: new Date(), role: "CUSTOMER" } });
+    createdUserIds.push(otherGoogle.id);
+    identity = { googleId: `second-google-${suffix}`, email: otherGoogle.email, name: "Someone" };
+    assert.equal((await googleSignIn()).error, "GOOGLE_ACCOUNT_NOT_LINKED");
+    assert.equal((await app.prisma.user.findUniqueOrThrow({ where: { id: otherGoogle.id } })).googleId, `first-google-${suffix}`);
+    // An inactive account is not linked either
+    const inactivePassword = await app.prisma.user.create({ data: { name: "Inactive Pw", email: `google-inactive-pw-${suffix}@example.test`, passwordHash: "existing-password", emailVerifiedAt: new Date(), role: "CUSTOMER", isActive: false } });
+    createdUserIds.push(inactivePassword.id);
+    identity = { googleId: `inactive-pw-${suffix}`, email: inactivePassword.email, name: "Someone" };
+    assert.equal((await googleSignIn()).error, "ACCOUNT_INACTIVE");
+    assert.equal((await app.prisma.user.findUniqueOrThrow({ where: { id: inactivePassword.id } })).googleId, null);
 
     // --- Inactive linked account ---
     const inactiveUser = await app.prisma.user.create({ data: { name: "Inactive", email: `google-inactive-${suffix}@example.test`, googleId: `inactive-${suffix}`, passwordHash: "existing-password", role: "CUSTOMER", isActive: false } });

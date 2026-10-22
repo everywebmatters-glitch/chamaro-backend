@@ -89,10 +89,17 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
     let user = await repository.findByGoogleId(identity.googleId);
     if (!user) {
       const existing = await repository.findByEmail(identity.email);
-      // Do not silently attach a Google identity to an existing password account -- that
-      // would let anyone who controls a Google account with a matching email take over an
-      // unrelated local account. Linking requires an explicit, separately-designed flow.
-      if (existing) throw googleAccountNotLinked();
+      if (existing) {
+        // Google has verified this address (verifyGoogleCallback refuses anything else), so a shopper who registered with
+        // a password and now uses Google is the same person: the customer account is linked and signed in. Never linked
+        // automatically: an administrator account, or one already tied to a different Google identity.
+        if (existing.role !== "CUSTOMER" || existing.googleId) throw googleAccountNotLinked();
+        if (!existing.isActive) throw accountInactive();
+        const linked = await repository.linkGoogleToCustomer(existing, identity.googleId);
+        if (!linked) throw googleAccountNotLinked();
+        options.log?.info({ userId: linked.id, hadVerifiedEmail: existing.emailVerifiedAt !== null }, "Google identity linked to an existing customer account");
+        return linked;
+      }
       user = await repository.createGoogleCustomer({ name: identity.name, email: identity.email, googleId: identity.googleId });
     }
     if (!user.isActive) throw accountInactive();
