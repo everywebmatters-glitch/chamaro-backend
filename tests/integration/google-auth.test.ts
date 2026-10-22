@@ -240,7 +240,13 @@ test("Google OAuth browser flow: state, callback redirects, PKCE code exchange, 
     const adminByEmail = await app.prisma.user.create({ data: { name: "Admin", email: `google-admin-email-${suffix}@example.test`, passwordHash: "existing-password", emailVerifiedAt: new Date(), role: "ADMIN" } });
     createdUserIds.push(adminByEmail.id);
     identity = { googleId: `attacker-admin-${suffix}`, email: adminByEmail.email, name: "Someone" };
-    assert.equal((await googleSignIn()).error, "GOOGLE_ACCOUNT_NOT_LINKED");
+    // The exact failure seen in production: an administrator's address used for Google sign-in on the storefront. It now
+    // has its own code (it used to be the generic GOOGLE_ACCOUNT_NOT_LINKED) and still links and signs in nothing.
+    const adminResult = await googleSignIn();
+    assert.equal(adminResult.error, "GOOGLE_ACCOUNT_ADMIN");
+    assert.equal(adminResult.exchanged, null, "no sign-in code is issued");
+    assert.equal(await app.prisma.authSession.count({ where: { userId: adminByEmail.id } }), 0, "and no session is created");
+    assert.equal((await app.prisma.user.findUniqueOrThrow({ where: { id: adminByEmail.id } })).passwordHash, "existing-password");
     assert.equal((await app.prisma.user.findUniqueOrThrow({ where: { id: adminByEmail.id } })).googleId, null);
     const otherGoogle = await app.prisma.user.create({ data: { name: "Other", email: `google-other-${suffix}@example.test`, googleId: `first-google-${suffix}`, passwordHash: "existing-password", emailVerifiedAt: new Date(), role: "CUSTOMER" } });
     createdUserIds.push(otherGoogle.id);

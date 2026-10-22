@@ -31,6 +31,13 @@ function googleAccountConflict(): Error {
   return Object.assign(new Error("This Google account is linked to a different Chamaro account"), { statusCode: 409, code: "GOOGLE_ACCOUNT_CONFLICT" });
 }
 
+// The Google-verified address belongs to a Chamaro administrator account. Administrators and shoppers share one user table
+// and one unique email, so an administrator's address can't also be a shopper account; it is never linked or signed in
+// through the storefront.
+function googleAccountAdmin(): Error {
+  return Object.assign(new Error("This email belongs to an administrator account"), { statusCode: 409, code: "GOOGLE_ACCOUNT_ADMIN" });
+}
+
 function googleAccountNotLinked(): Error {
   return Object.assign(new Error("An account already exists for this email; sign in with its existing method to link Google"), { statusCode: 409, code: "GOOGLE_ACCOUNT_NOT_LINKED" });
 }
@@ -113,11 +120,22 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
       // address is verified is linked and signed in, keeping its id, orders, cart and password. Never linked
       // automatically: an administrator account, one tied to another Google identity, or one whose address was never
       // verified.
-      if (holder.role !== "CUSTOMER" || holder.googleId) throw googleAccountNotLinked();
+      // Why a sign-in is refused is logged as a reason code and an opaque account id only: never an address, token or code.
+      if (holder.role !== "CUSTOMER") {
+        options.log?.warn({ reason: "ADMIN_ACCOUNT", accountId: holder.id }, "Google sign-in refused");
+        throw googleAccountAdmin();
+      }
+      if (holder.googleId) {
+        options.log?.warn({ reason: "LINKED_TO_ANOTHER_GOOGLE_IDENTITY", accountId: holder.id }, "Google sign-in refused");
+        throw googleAccountNotLinked();
+      }
       if (!holder.isActive) throw accountInactive();
       if (!holder.emailVerifiedAt) throw googleEmailNeedsVerification();
       const linked = await repository.linkGoogleToCustomer(holder.id, identity.googleId);
-      if (!linked) throw googleAccountNotLinked();
+      if (!linked) {
+        options.log?.warn({ reason: "LINK_CLAIM_LOST", accountId: holder.id }, "Google sign-in refused");
+        throw googleAccountNotLinked();
+      }
       options.log?.info({ userId: linked.id }, "Google identity linked to an existing customer account");
       user = linked;
     } else {
