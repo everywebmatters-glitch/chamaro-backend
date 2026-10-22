@@ -23,6 +23,7 @@ Object.assign(process.env, {
   DELHIVERY_API_BASE_URL: "https://staging-express.delhivery.com",
   DELHIVERY_API_TOKEN: "fakestagingtoken000000000001",
   DELHIVERY_PICKUP_LOCATION: "Chamaro Test Warehouse",
+  DELHIVERY_SCAN_PUSH_ENABLED: "true",
   DELHIVERY_WEBHOOK_SECRET: "test-delhivery-webhook-secret-0001",
   APP_ENV: "development",
 });

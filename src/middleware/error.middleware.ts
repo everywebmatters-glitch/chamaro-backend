@@ -38,7 +38,7 @@ export function errorResponse(error: RawError): ErrorResponse {
 // answer that needs someone to act. Every other 4xx is the API working as intended and is logged at info.
 const NOTABLE_REFUSALS = new Set(["WEBHOOK_UNAUTHORIZED", "CONFLICT_RETRY", "PINCODE_NOT_SERVICEABLE", "PICKUP_OUTCOME_UNKNOWN"]);
 // A 5xx that reports a state someone chose (shipping switched off), not a failure.
-const EXPECTED_UNAVAILABLE = new Set(["SHIPPING_DISABLED"]);
+const EXPECTED_UNAVAILABLE = new Set(["SHIPPING_DISABLED", "SCAN_PUSH_DISABLED"]);
 
 // error: the request failed because something is broken or an upstream (e.g. Delhivery) failed or refused us.
 // warn:  a refusal worth noticing (see NOTABLE_REFUSALS, rate limiting) or an intentionally disabled feature.

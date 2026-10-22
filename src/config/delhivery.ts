@@ -34,7 +34,7 @@ export type DelhiveryConfig = {
 const PLACEHOLDER = /replace|change[-_ ]?me|example|placeholder|your[-_ ]?(token|secret)|^x+$/i;
 
 // 503 for an operator problem (shipping off or misconfigured): the request was fine, the service is not ready.
-function unavailable(code: "SHIPPING_DISABLED" | "DELHIVERY_NOT_CONFIGURED", message: string): Error {
+function unavailable(code: "SHIPPING_DISABLED" | "DELHIVERY_NOT_CONFIGURED" | "SCAN_PUSH_DISABLED", message: string): Error {
   return Object.assign(new Error(message), { statusCode: 503, code, expose: true });
 }
 
@@ -93,6 +93,9 @@ export function readDelhiveryConfig(env: NodeJS.ProcessEnv = process.env): Delhi
 // (and refused) the same way whether or not the rest is configured.
 export function readWebhookSecret(env: NodeJS.ProcessEnv = process.env): string {
   if (!shippingEnabled(env)) throw unavailable("SHIPPING_DISABLED", "Courier shipping is not enabled");
+  // Off until how Delhivery authenticates its scan push has been confirmed from its official documentation and with
+  // Delhivery; tracking is read by the shipment worker and the admin's Refresh tracking meanwhile.
+  if (env.DELHIVERY_SCAN_PUSH_ENABLED?.trim() !== "true") throw unavailable("SCAN_PUSH_DISABLED", "Delhivery scan push is not enabled");
   const secret = requiredSetting(env, "DELHIVERY_WEBHOOK_SECRET");
   if (secret.length < 32 || PLACEHOLDER.test(secret)) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_WEBHOOK_SECRET must be a random value of at least 32 characters");
   return secret;

@@ -200,6 +200,13 @@ and `DELHIVERY_HSN_CODE`), `QUEUED` with `DELHIVERY_NOT_CONFIGURED` naming the s
 the first pass after the settings are fixed. A shipment flagged `BOOKED_FOR_INELIGIBLE_ORDER` was booked just as its order
 was refunded or cancelled: cancel it in Delhivery.
 
+Delhivery's scan-push webhook (`POST /api/v1/webhooks/delhivery/scans`) stays off (`503 SCAN_PUSH_DISABLED`) unless
+`DELHIVERY_SCAN_PUSH_ENABLED=true`. Do not set it until how Delhivery authenticates the push has been confirmed from its
+official documentation and with Delhivery; tracking is read by the shipment worker and by "Refresh tracking" in Retail
+Orders. Settings (names only; values live in Secret Manager or the manifests): `DELHIVERY_ENABLED`,
+`DELHIVERY_AUTO_BOOKING`, `DELHIVERY_API_BASE_URL`, `DELHIVERY_API_TOKEN`, `DELHIVERY_PICKUP_LOCATION`,
+`DELHIVERY_SELLER_GST_TIN`, `DELHIVERY_HSN_CODE`, `DELHIVERY_WEBHOOK_SECRET`, `DELHIVERY_SCAN_PUSH_ENABLED`.
+
 ## Notes
 
 - Swagger (`/docs`) is off in production. `/health` does not touch the database.

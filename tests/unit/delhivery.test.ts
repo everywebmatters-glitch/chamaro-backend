@@ -57,11 +57,12 @@ test("config: Delhivery production is refused outside APP_ENV=production, and st
 });
 
 test("config: the webhook secret must be set, long and not a placeholder", () => {
-  assert.throws(() => readWebhookSecret(env()), /DELHIVERY_WEBHOOK_SECRET is not set/);
-  assert.throws(() => readWebhookSecret(env({ DELHIVERY_WEBHOOK_SECRET: "too-short" })), /at least 32/);
-  assert.throws(() => readWebhookSecret(env({ DELHIVERY_WEBHOOK_SECRET: "replace-with-a-long-random-webhook-secret" })), /at least 32/);
+  assert.throws(() => readWebhookSecret(env({ DELHIVERY_WEBHOOK_SECRET: "Q8v2LmZr4TnW7pXy1sDfH6jK9bNc3VgA" })), { code: "SCAN_PUSH_DISABLED" }, "off unless DELHIVERY_SCAN_PUSH_ENABLED=true");
+  assert.throws(() => readWebhookSecret(env({ DELHIVERY_SCAN_PUSH_ENABLED: "true" })), /DELHIVERY_WEBHOOK_SECRET is not set/);
+  assert.throws(() => readWebhookSecret(env({ DELHIVERY_SCAN_PUSH_ENABLED: "true", DELHIVERY_WEBHOOK_SECRET: "too-short" })), /at least 32/);
+  assert.throws(() => readWebhookSecret(env({ DELHIVERY_SCAN_PUSH_ENABLED: "true", DELHIVERY_WEBHOOK_SECRET: "replace-with-a-long-random-webhook-secret" })), /at least 32/);
   assert.throws(() => readWebhookSecret(env({ DELHIVERY_ENABLED: "false", DELHIVERY_WEBHOOK_SECRET: "k".repeat(10) + "Q8v2LmZr4TnW7pXy1sDf" })), { code: "SHIPPING_DISABLED" });
-  assert.equal(readWebhookSecret(env({ DELHIVERY_WEBHOOK_SECRET: "Q8v2LmZr4TnW7pXy1sDfH6jK9bNc3VgA" })).length, 32);
+  assert.equal(readWebhookSecret(env({ DELHIVERY_SCAN_PUSH_ENABLED: "true", DELHIVERY_WEBHOOK_SECRET: "Q8v2LmZr4TnW7pXy1sDfH6jK9bNc3VgA" })).length, 32);
 });
 
 // ---- client --------------------------------------------------------------------------------------------------------
