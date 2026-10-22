@@ -49,7 +49,7 @@ setRazorpayClientForTests({
 
 // ---- fake Delhivery ----------------------------------------------------------------------------------------------------
 // mode: ok | reject (400, nothing created) | timeout-created (Delhivery creates it but the answer is lost) | timeout
-const delhivery = { creates: 0, inFlight: 0, maxInFlight: 0, mode: "ok" as "ok" | "reject" | "timeout-created" | "timeout", nonServiceable: new Set<string>(), byRef: new Map<string, string>(), next: 9300000000000 };
+const delhivery = { creates: 0, inFlight: 0, maxInFlight: 0, mode: "ok" as "ok" | "reject" | "timeout-created" | "timeout", nonServiceable: new Set<string>(), byRef: new Map<string, string>(), next: 9300000000000, onCreate: null as (() => Promise<void>) | null };
 setDelhiveryFetchForTests(async (rawUrl, init) => {
   const url = new URL(rawUrl);
   assert.equal(url.origin, "https://staging-express.delhivery.com", "only Delhivery staging is ever called");
@@ -63,6 +63,7 @@ setDelhiveryFetchForTests(async (rawUrl, init) => {
     delhivery.maxInFlight = Math.max(delhivery.maxInFlight, delhivery.inFlight);
     await new Promise((resolve) => setTimeout(resolve, 20));
     delhivery.inFlight--;
+    await delhivery.onCreate?.(); // a test's chance to change the order while the booking call is in flight
     const ref = JSON.parse(new URLSearchParams(init.body).get("data")!).shipments[0].order as string;
     if (delhivery.mode === "reject") return json(400, { error: "Invalid consignee details" });
     if (delhivery.mode === "timeout") throw new Error("timeout");
@@ -165,6 +166,7 @@ async function withShop(run: (shop: Shop) => Promise<void>) {
   Object.assign(delhivery, { creates: 0, inFlight: 0, maxInFlight: 0, mode: "ok" });
   delhivery.nonServiceable.clear();
   delhivery.byRef.clear();
+  delhivery.onCreate = null;
   process.env.DELHIVERY_AUTO_BOOKING = "true";
   const { buildApp } = await import("../../src/app.js");
   const app = await buildApp();
@@ -356,4 +358,48 @@ test("an order refunded before the worker runs is not booked; its queued booking
     assert.equal((await shop.worker.bookDue()).withdrawn, 1);
     assert.deepEqual([(await shop.shipment(o.orderId))?.status, (await shop.shipment(o.orderId))?.lastErrorCode], ["CANCELLED", "ORDER_NOT_PAID"]);
     assert.equal(delhivery.creates, 0);
+  }));
+
+test("missing Delhivery settings: the order stays paid, its booking waits QUEUED with the reason and is booked once the settings are fixed", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const o = await shop.openOrder();
+    await shop.pay(o.razorpayOrderId);
+    const location = process.env.DELHIVERY_PICKUP_LOCATION;
+    delete process.env.DELHIVERY_PICKUP_LOCATION;
+    try {
+      const waiting = await shop.worker.bookDue();
+      assert.equal(waiting.booked, 0);
+      assert.equal(waiting.waitingForSettings, 1, JSON.stringify(waiting));
+      const row = await shop.shipment(o.orderId);
+      assert.deepEqual([row?.status, row?.lastErrorCode, row?.waybill], ["QUEUED", "DELHIVERY_NOT_CONFIGURED", null]);
+      assert.ok(row?.lastErrorRemark?.includes("DELHIVERY_PICKUP_LOCATION"), "names the setting to fix");
+      assert.equal((await shop.app.prisma.retailOrder.findUniqueOrThrow({ where: { id: o.orderId } })).paymentStatus, "PAID");
+      assert.equal(delhivery.creates, 0);
+    } finally {
+      process.env.DELHIVERY_PICKUP_LOCATION = location;
+    }
+    // Not flipped to CREATE_FAILED: the next pass books it and clears the reason.
+    assert.equal((await shop.worker.bookDue()).booked, 1);
+    const row = await shop.shipment(o.orderId);
+    assert.deepEqual([row?.status, row?.lastErrorCode], ["MANIFESTED", null]);
+    assert.equal(delhivery.creates, 1);
+  }));
+
+test("a refund that lands while Delhivery is being called: the AWB is kept, the order is not touched, the shipment is flagged", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const o = await shop.openOrder();
+    await shop.pay(o.razorpayOrderId);
+    delhivery.onCreate = async () => {
+      await shop.app.prisma.retailOrder.update({ where: { id: o.orderId }, data: { paymentStatus: "REFUNDED", status: "CANCELLED" } });
+    };
+    await shop.worker.bookDue();
+    const row = await shop.shipment(o.orderId);
+    assert.equal(row?.status, "MANIFESTED");
+    assert.ok(row?.waybill, "the AWB is recorded from Delhivery's answer");
+    assert.equal(row?.lastErrorCode, "BOOKED_FOR_INELIGIBLE_ORDER");
+    const order = await shop.app.prisma.retailOrder.findUniqueOrThrow({ where: { id: o.orderId } });
+    assert.deepEqual([order.paymentStatus, order.status, order.trackingNumber], ["REFUNDED", "CANCELLED", null]);
+    assert.equal(delhivery.creates, 1);
+    assert.equal((await shop.worker.bookDue()).booked, 0, "never booked again");
+    assert.equal(delhivery.creates, 1);
   }));

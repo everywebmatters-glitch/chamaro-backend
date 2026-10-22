@@ -33,6 +33,9 @@ const AUTO_RETRY_MINUTES = [2, 10, 30, 120];
 // Refusals that mean the order should not be booked at all any more (refunded, cancelled, shipped by hand meanwhile):
 // the queued booking is withdrawn. Any other refusal is left for an admin.
 const NOT_TO_BE_BOOKED = new Set(["ORDER_NOT_PAID", "ORDER_NOT_PAID_LIVE", "ORDER_NOT_SHIPPABLE", "ORDER_ALREADY_SHIPPED"]);
+// Not a problem with any order: shipping is off or misconfigured (missing token, pickup location, seller GSTIN or HSN
+// code). Queued bookings wait, still QUEUED, for the operator to fix the settings; they are never marked failed for it.
+const OPERATOR_CONFIG_CODES = new Set(["SHIPPING_DISABLED", "DELHIVERY_NOT_CONFIGURED"]);
 const PICKUP_LEASE_MS = 2 * 60_000;
 // Delhivery: an e-waybill is mandatory when the shipment value is Rs. 50,000 or more.
 const EWAYBILL_THRESHOLD_MINOR = 50_000 * 100;
@@ -261,13 +264,24 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
       }
 
       const { waybill, uploadWbn } = result;
-      await retryOnConflict(() => prisma.$transaction(async (tx) => {
-        const finalized = await tx.shipment.updateMany({ where: mine, data: { status: "MANIFESTED", waybill, uploadWbn, lockedUntil: null, needsReconcile: false, lastErrorCode: null, lastErrorRemark: null, manifestedAt: new Date() } });
+      // The order is locked again to record the booking: a refund or cancellation that landed while Delhivery was being
+      // called is seen here. The AWB is still kept (the shipment exists at Delhivery), but the order is left alone and the
+      // shipment is flagged for an admin to cancel in Delhivery.
+      const eligible = await retryOnConflict(() => prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM RetailOrder WHERE id = ${orderId} FOR UPDATE`;
+        const current = await tx.retailOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true, paymentStatus: true } });
+        const stillEligible = current.paymentStatus === "PAID" && SHIPPABLE_ORDER_STATUSES.has(current.status) && (await orderPaidLive(tx, orderId));
+        const flag = stillEligible ? { lastErrorCode: null, lastErrorRemark: null } : { lastErrorCode: "BOOKED_FOR_INELIGIBLE_ORDER", lastErrorRemark: "The order was refunded or cancelled while this was being booked; cancel the shipment in Delhivery" };
+        const finalized = await tx.shipment.updateMany({ where: mine, data: { status: "MANIFESTED", waybill, uploadWbn, lockedUntil: null, needsReconcile: false, ...flag, manifestedAt: new Date() } });
         if (finalized.count !== 1) throw httpError(409, "SHIPMENT_IN_PROGRESS", "Another attempt took over this shipment; reload the order");
-        await tx.retailOrder.update({ where: { id: orderId }, data: { carrier: "Delhivery", trackingNumber: waybill } });
-        await tx.retailOrder.updateMany({ where: { id: orderId, status: { in: ["PENDING", "CONFIRMED"] } }, data: { status: "PROCESSING" } });
+        if (stillEligible) {
+          await tx.retailOrder.update({ where: { id: orderId }, data: { carrier: "Delhivery", trackingNumber: waybill } });
+          await tx.retailOrder.updateMany({ where: { id: orderId, status: { in: ["PENDING", "CONFIRMED"] } }, data: { status: "PROCESSING" } });
+        }
+        return stillEligible;
       }));
-      options.log?.info({ orderId, shipmentId: claim.shipmentId, environment: client.environment }, "Delhivery shipment created");
+      if (!eligible) options.log?.error({ orderId, shipmentId: claim.shipmentId }, "Delhivery shipment booked for an order that is no longer to be shipped; it needs cancelling");
+      else options.log?.info({ orderId, shipmentId: claim.shipmentId, environment: client.environment }, "Delhivery shipment created");
       return orders.adminGetOrder(orderId);
     },
 
@@ -284,6 +298,18 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
     // (refunded, cancelled, shipped by hand) has its queued booking withdrawn.
     async bookDue(limit = BATCH) {
       const now = new Date();
+      // Settings first: with a missing pickup location, GSTIN or HSN code every booking would be refused, so none is
+      // attempted. The waiting bookings keep QUEUED and carry the reason (it names the setting, never a value), and are
+      // booked by the first pass after the settings are fixed.
+      try {
+        readDelhiveryConfig();
+      } catch (error) {
+        const code = (error as { code?: string }).code ?? "DELHIVERY_NOT_CONFIGURED";
+        if (!OPERATOR_CONFIG_CODES.has(code)) throw error;
+        const waiting = await prisma.shipment.updateMany({ where: { autoBooked: true, waybill: null, status: "QUEUED" }, data: { lastErrorCode: code, lastErrorRemark: error instanceof Error ? error.message.slice(0, 250) : null } });
+        options.log?.error({ queued: waiting.count, err: { code } }, "Automatic courier booking is waiting for Delhivery settings");
+        return { due: waiting.count, booked: 0, retryLater: 0, needsAdmin: 0, withdrawn: 0, busy: 0, waitingForSettings: waiting.count };
+      }
       const due = await prisma.shipment.findMany({
         where: {
           autoBooked: true,
@@ -298,7 +324,7 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
         take: limit,
         select: { id: true, orderId: true },
       });
-      const tally = { due: due.length, booked: 0, retryLater: 0, needsAdmin: 0, withdrawn: 0, busy: 0 };
+      const tally = { due: due.length, booked: 0, retryLater: 0, needsAdmin: 0, withdrawn: 0, busy: 0, waitingForSettings: 0 };
       for (const row of due) {
         try {
           await this.createForOrder(row.orderId, {});
@@ -309,6 +335,7 @@ export function createShipmentService(prisma: PrismaClient, options: { log?: Fas
             tally.busy++;
             continue;
           }
+          if (OPERATOR_CONFIG_CODES.has(code)) continue; // settings changed mid-pass: the row stays as it was
           const current = await prisma.shipment.findUnique({ where: { id: row.id }, select: { status: true, attempts: true, needsReconcile: true } });
           if (!current || current.status === "CREATING") continue;
           if (current.status === "QUEUED" && NOT_TO_BE_BOOKED.has(code)) {

@@ -75,6 +75,14 @@ spec:
                 # Live keys are refused without this (and APP_ENV=production, which the image sets).
                 - name: RAZORPAY_ALLOW_LIVE_KEYS
                   value: "true"
+                # This job also settles payments (reconcile), and settling a verified live payment queues the courier
+                # booking in the same transaction. Both must equal chamaro-api's values, or a payment settled here would
+                # not be queued. They only record the booking; the shipment worker alone calls Delhivery, so no Delhivery
+                # token is needed here. Keep "false" until live dispatch is approved.
+                - name: DELHIVERY_ENABLED
+                  value: "false"
+                - name: DELHIVERY_AUTO_BOOKING
+                  value: "false"
               resources:
                 limits:
                   cpu: 1000m

@@ -185,6 +185,21 @@ Migration `0012_delhivery_shipments` is additive (three new tables). Tracking is
 each scan Delhivery pushes, by `POST /api/v1/webhooks/delhivery/scans` (Delhivery sets the push up on request; the
 body is only used to pick which AWB to re-read from the tracking API).
 
+## Automatic courier booking (off)
+
+A verified **live** Razorpay payment queues a Delhivery booking in the same transaction that marks the order paid; only
+the shipment worker calls Delhivery. `DELHIVERY_ENABLED` and `DELHIVERY_AUTO_BOOKING` must have the same value on
+**chamaro-api** (checkout callback and webhook settle payments), **payment-worker** (reconcile settles payments too) and
+**shipment-tracking** (books and tracks); leave them `false` everywhere until live dispatch is approved. Test-mode
+payments never queue a booking.
+
+What a paid order shows in Retail Orders: `Booking queued` (the worker books it), `Booking needs attention` with the reason
+(`PARCEL_DETAILS_MISSING`, `MULTI_PARCEL_ORDER`, `ADDRESS_INCOMPLETE`, `PINCODE_NOT_SERVICEABLE`, ...), or, when Delhivery
+settings are missing (`DELHIVERY_API_TOKEN`, `DELHIVERY_PICKUP_LOCATION`, and on the production host `DELHIVERY_SELLER_GST_TIN`
+and `DELHIVERY_HSN_CODE`), `QUEUED` with `DELHIVERY_NOT_CONFIGURED` naming the setting. Those bookings wait and are booked by
+the first pass after the settings are fixed. A shipment flagged `BOOKED_FOR_INELIGIBLE_ORDER` was booked just as its order
+was refunded or cancelled: cancel it in Delhivery.
+
 ## Notes
 
 - Swagger (`/docs`) is off in production. `/health` does not touch the database.
