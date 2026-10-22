@@ -13,7 +13,9 @@ import {
 } from "../utils/google-oauth.tokens.js";
 
 async function issueToken(reply: FastifyReply, user: { id: string; name: string; email: string; role: Role }) {
-  const token = await reply.jwtSign({ role: user.role }, { sign: { sub: user.id } });
+  // An administrator's session is short (2 hours, customers keep the 8-hour default): a stolen admin token is useful for
+  // far less time. Deactivating the account ends it at once (requireAdmin reads isActive from the database).
+  const token = await reply.jwtSign({ role: user.role }, { sign: { sub: user.id, ...(user.role === "ADMIN" ? { expiresIn: "2h" } : {}) } });
   const authenticatedUser: AuthenticatedUser = { id: user.id, name: user.name, email: user.email, role: user.role };
   return { token, user: authenticatedUser };
 }
