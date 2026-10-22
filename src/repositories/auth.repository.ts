@@ -19,26 +19,14 @@ export function createAuthRepository(prisma: PrismaClient) {
     createGoogleCustomer: (data: { name: string; email: string; googleId: string }) =>
       prisma.user.create({ data: { ...data, passwordHash: GOOGLE_OAUTH_NO_PASSWORD, emailVerifiedAt: new Date(), role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } } }),
 
-    // Attaches a Google identity to an existing CUSTOMER account whose address Google has just verified. Claimed
-    // atomically (only while the account has no Google identity). If the account's own address was never verified, someone
-    // else may have registered it with a password they know, so that password is disabled and every session and reset
-    // link of the account ends with the link; the real owner signs in with Google, or sets a new password by email.
-    // Returns null when the account was linked, changed or is not a customer in the meantime.
-    linkGoogleToCustomer: (existing: { id: string; emailVerifiedAt: Date | null }, googleId: string) =>
-      prisma.$transaction(async (tx) => {
-        const now = new Date();
-        const unverified = existing.emailVerifiedAt === null;
-        const claimed = await tx.user.updateMany({
-          where: { id: existing.id, role: "CUSTOMER", googleId: null },
-          data: { googleId, emailVerifiedAt: existing.emailVerifiedAt ?? now, ...(unverified ? { passwordHash: GOOGLE_OAUTH_NO_PASSWORD } : {}) },
-        });
-        if (claimed.count !== 1) return null;
-        if (unverified) {
-          await tx.authSession.updateMany({ where: { userId: existing.id, revokedAt: null }, data: { revokedAt: now } });
-          await tx.passwordResetToken.updateMany({ where: { userId: existing.id, usedAt: null }, data: { usedAt: now } });
-        }
-        return tx.user.findUniqueOrThrow({ where: { id: existing.id } });
-      }),
+    // Attaches a Google identity to an existing, active CUSTOMER account whose own address is already verified. It sets
+    // googleId and nothing else: the password, role, status and every other field are left exactly as they are. The
+    // claim is atomic (only while the account has no Google identity), so two requests can't link two identities.
+    // Returns null when the account was linked, changed, deactivated or is not a verified customer in the meantime.
+    linkGoogleToCustomer: async (accountId: string, googleId: string) => {
+      const claimed = await prisma.user.updateMany({ where: { id: accountId, role: "CUSTOMER", isActive: true, googleId: null, emailVerifiedAt: { not: null } }, data: { googleId } });
+      return claimed.count === 1 ? prisma.user.findUniqueOrThrow({ where: { id: accountId } }) : null;
+    },
 
     // Records that the holder of `email` proved they read mail there. Only while the account still has that address
     // and was not verified already, so a later address can never inherit an earlier proof.

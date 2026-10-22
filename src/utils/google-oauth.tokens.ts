@@ -20,7 +20,7 @@ const COOKIE_PATH = "/api/v1/auth/google";
 const STATE_TTL_SECONDS = 10 * 60;
 
 type StatePayload = { purpose: "google_oauth_state"; nonce: string; cc: string };
-type ExchangePayload = { purpose: "google_exchange_code"; cc: string; sub: string };
+type ExchangePayload = { purpose: "google_exchange_code"; cc: string; sub: string; jti: string; exp: number };
 
 function derivedKey(purpose: string): Buffer {
   return createHmac("sha256", env.JWT_SECRET).update(`chamaro:${purpose}`).digest();
@@ -57,16 +57,17 @@ export function verifyOAuthState(app: FastifyInstance, state: string | undefined
 }
 
 export function createExchangeCode(app: FastifyInstance, userId: string, codeChallenge: string): string {
-  return app.jwt.sign({ purpose: "google_exchange_code", cc: codeChallenge }, { key: derivedKey("google-exchange-code"), algorithm: "HS256", sub: userId, expiresIn: "60s" });
+  // jti makes every code unique, so the exchange route can accept each one once (see SessionService.useExchangeCodeOnce).
+  return app.jwt.sign({ purpose: "google_exchange_code", cc: codeChallenge }, { key: derivedKey("google-exchange-code"), algorithm: "HS256", sub: userId, jti: randomBytes(16).toString("hex"), expiresIn: "60s" });
 }
 
-// Returns the user ID the code was issued for.
-export function verifyExchangeCode(app: FastifyInstance, code: string, codeVerifier: string): string {
+// Returns the user the code was issued for, with the code's unique id and expiry (for single use).
+export function verifyExchangeCode(app: FastifyInstance, code: string, codeVerifier: string): { userId: string; jti: string; expiresAt: Date } {
   const invalid = () => oauthError("Invalid or expired sign-in code", "OAUTH_CODE_INVALID");
   let payload: ExchangePayload;
   try { payload = app.jwt.verify<ExchangePayload>(code, { key: derivedKey("google-exchange-code"), algorithms: ["HS256"] }); } catch { throw invalid(); }
-  if (payload.purpose !== "google_exchange_code" || !payload.sub || !safeEqual(payload.cc, sha256(codeVerifier))) throw invalid();
-  return payload.sub;
+  if (payload.purpose !== "google_exchange_code" || !payload.sub || !payload.jti || !safeEqual(payload.cc, sha256(codeVerifier))) throw invalid();
+  return { userId: payload.sub, jti: payload.jti, expiresAt: new Date(payload.exp * 1000) };
 }
 
 function cookie(value: string, maxAgeSeconds: number): string {

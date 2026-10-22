@@ -19,6 +19,18 @@ function invalidCredentials(): Error {
 function accountInactive(): Error {
   return Object.assign(new Error("Account is inactive"), { statusCode: 403, code: "ACCOUNT_INACTIVE" });
 }
+// The address is Google-verified but the Chamaro account holding it never verified its own address (an account made
+// before addresses were verified). Linking it automatically could hand it to whoever registered it first, so it needs the
+// owner to prove the mailbox once (Forgot password verifies it); nothing on the account is changed meanwhile.
+function googleEmailNeedsVerification(): Error {
+  return Object.assign(new Error("Verify this account's email first; then Google sign-in will work"), { statusCode: 409, code: "GOOGLE_EMAIL_NEEDS_VERIFICATION" });
+}
+
+// This Google account is already linked to a different Chamaro account than the one holding its current address.
+function googleAccountConflict(): Error {
+  return Object.assign(new Error("This Google account is linked to a different Chamaro account"), { statusCode: 409, code: "GOOGLE_ACCOUNT_CONFLICT" });
+}
+
 function googleAccountNotLinked(): Error {
   return Object.assign(new Error("An account already exists for this email; sign in with its existing method to link Google"), { statusCode: 409, code: "GOOGLE_ACCOUNT_NOT_LINKED" });
 }
@@ -85,21 +97,30 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
     }
   }
 
+  // identity is Google-verified: signature, issuer, audience, expiry and email_verified are checked by
+  // verifyGoogleCallback before anything here runs, and the address is lower-cased.
   async function loginWithGoogle(identity: GoogleIdentity) {
-    let user = await repository.findByGoogleId(identity.googleId);
-    if (!user) {
-      const existing = await repository.findByEmail(identity.email);
-      if (existing) {
-        // Google has verified this address (verifyGoogleCallback refuses anything else), so a shopper who registered with
-        // a password and now uses Google is the same person: the customer account is linked and signed in. Never linked
-        // automatically: an administrator account, or one already tied to a different Google identity.
-        if (existing.role !== "CUSTOMER" || existing.googleId) throw googleAccountNotLinked();
-        if (!existing.isActive) throw accountInactive();
-        const linked = await repository.linkGoogleToCustomer(existing, identity.googleId);
-        if (!linked) throw googleAccountNotLinked();
-        options.log?.info({ userId: linked.id, hadVerifiedEmail: existing.emailVerifiedAt !== null }, "Google identity linked to an existing customer account");
-        return linked;
-      }
+    const owner = await repository.findByGoogleId(identity.googleId);
+    const holder = await repository.findByEmail(identity.email);
+    let user: NonNullable<typeof owner>;
+    if (owner) {
+      // This Google account is already linked. If its address now belongs to a different Chamaro account, the two are
+      // never merged or guessed between: refused.
+      if (holder && holder.id !== owner.id) throw googleAccountConflict();
+      user = owner;
+    } else if (holder) {
+      // A shopper who registered with a password and now uses Google is the same person, so a customer account whose own
+      // address is verified is linked and signed in, keeping its id, orders, cart and password. Never linked
+      // automatically: an administrator account, one tied to another Google identity, or one whose address was never
+      // verified.
+      if (holder.role !== "CUSTOMER" || holder.googleId) throw googleAccountNotLinked();
+      if (!holder.isActive) throw accountInactive();
+      if (!holder.emailVerifiedAt) throw googleEmailNeedsVerification();
+      const linked = await repository.linkGoogleToCustomer(holder.id, identity.googleId);
+      if (!linked) throw googleAccountNotLinked();
+      options.log?.info({ userId: linked.id }, "Google identity linked to an existing customer account");
+      user = linked;
+    } else {
       user = await repository.createGoogleCustomer({ name: identity.name, email: identity.email, googleId: identity.googleId });
     }
     if (!user.isActive) throw accountInactive();

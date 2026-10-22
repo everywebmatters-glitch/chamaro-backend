@@ -45,6 +45,8 @@ const GOOGLE_CALLBACK_ERRORS = new Set([
   "GOOGLE_ID_TOKEN_MISSING",
   "GOOGLE_EMAIL_UNVERIFIED",
   "GOOGLE_ACCOUNT_NOT_LINKED",
+  "GOOGLE_ACCOUNT_CONFLICT",
+  "GOOGLE_EMAIL_NEEDS_VERIFICATION",
   "ACCOUNT_INACTIVE",
 ]);
 
@@ -103,8 +105,12 @@ export function createAuthController(service: AuthService, sessions: SessionServ
 
     async googleExchange(request: FastifyRequest, reply: FastifyReply) {
       const { code, codeVerifier } = request.body as { code: string; codeVerifier: string };
-      const userId = verifyExchangeCode(request.server, code, codeVerifier);
-      const user = await service.getActiveUserForGoogleExchange(userId);
+      const redeemed = verifyExchangeCode(request.server, code, codeVerifier);
+      // One redemption per code: a replay (a code copied from a URL, history or log) is refused even inside its 60 seconds.
+      if (!(await sessions.useExchangeCodeOnce(redeemed.userId, redeemed.jti, redeemed.expiresAt))) {
+        throw Object.assign(new Error("Invalid or expired sign-in code"), { statusCode: 401, code: "OAUTH_CODE_INVALID" });
+      }
+      const user = await service.getActiveUserForGoogleExchange(redeemed.userId);
       return { success: true, data: await issueToken(sessions, request, reply, user) };
     },
 

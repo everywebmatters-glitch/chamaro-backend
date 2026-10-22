@@ -63,6 +63,20 @@ export function createSessionService(prisma: PrismaClient) {
       return { userId: row.userId, session: await insert(prisma, row.userId, row.familyId, userAgent, row.expiresAt) };
     },
 
+    // A Google exchange code may be redeemed once. The first redemption records a marker (an already-revoked row whose
+    // hash can't be a real session token, unique per code); a second redemption hits the unique index and is refused.
+    // The markers are deleted with the rest of the user's expired rows (see start).
+    async useExchangeCodeOnce(userId: string, jti: string, expiresAt: Date): Promise<boolean> {
+      const now = new Date();
+      try {
+        await prisma.authSession.create({ data: { userId, familyId: "oauth-exchange-code", tokenHash: hash(`oauth-exchange-code:${jti}`), expiresAt, usedAt: now, revokedAt: now } });
+        return true;
+      } catch (error) {
+        if ((error as { code?: string }).code === "P2002") return false;
+        throw error;
+      }
+    },
+
     // Ends the session the cookie belongs to (its whole family), whatever its state.
     async revokeFamilyOf(presented: string | undefined): Promise<void> {
       if (!presented || !TOKEN_SHAPE.test(presented)) return;
