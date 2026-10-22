@@ -45,6 +45,7 @@ model User {
   customer             Customer?
   checkoutVerification CheckoutVerification?
   passwordResetTokens  PasswordResetToken[]
+  authSessions         AuthSession[]
   reviews              Review[]
   emailNotifications   EmailNotification[]
   createdAt            DateTime              @default(now())
@@ -779,4 +780,28 @@ model B2BQuotationItem {
 
   @@index([quotationId])
   @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Customer sign-in sessions ("stay signed in"). The browser holds only an opaque random token in an HttpOnly cookie;
+// only its SHA-256 is stored here. Every use rotates it (a new row in the same family, the old one marked used), so a
+// copied token works once at most; presenting a used token again, after a short grace for two tabs refreshing at the
+// same moment, revokes the whole family. Changing the password revokes every session of the account.
+// ---------------------------------------------------------------------------
+
+model AuthSession {
+  id        String    @id @default(cuid())
+  userId    String
+  familyId  String    @db.VarChar(40)
+  tokenHash String    @unique @db.Char(64)
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  userAgent String?   @db.VarChar(191)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
 }

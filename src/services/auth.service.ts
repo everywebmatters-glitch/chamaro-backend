@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { revokeAllSessions } from "./session.service.js";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { FastifyBaseLogger } from "fastify";
 import type { Prisma, PrismaClient, Role } from "../../generated/prisma/client.js";
@@ -48,7 +49,9 @@ export function passwordResetUrl(token: string, role: Role = "CUSTOMER"): string
 // proves the holder reads mail at the account's address, so it goes to that (now verified) address. `eventKey`
 // names the change (the reset link or code used), so it is recorded once. Each account gets a link to its own
 // site's reset form.
-function enqueuePasswordChanged(tx: Prisma.TransactionClient, user: { id: string; name: string; email: string; role: Role; emailVerifiedAt: Date | null }, changedAt: Date, eventKey: string) {
+async function enqueuePasswordChanged(tx: Prisma.TransactionClient, user: { id: string; name: string; email: string; role: Role; emailVerifiedAt: Date | null }, changedAt: Date, eventKey: string) {
+  // Changing the password signs the account out everywhere: every persistent session ends with it.
+  await revokeAllSessions(tx, user.id);
   const resetUrl = user.role === "ADMIN" ? `${env.ADMIN_BASE_URL}/forgot-password/` : `${env.APP_BASE_URL}/account/login?reset=1`;
   return enqueueNotification(tx, {
     eventKey,

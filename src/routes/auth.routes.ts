@@ -21,6 +21,8 @@ import {
 } from "../schemas/otp.schema.js";
 import { createAuthService } from "../services/auth.service.js";
 import { createAuthController } from "../controllers/auth.controller.js";
+import { createSessionService } from "../services/session.service.js";
+import { routeSchema } from "../shared/http.js";
 
 const authRateLimit = { config: { rateLimit: { max: env.AUTH_RATE_LIMIT_MAX, timeWindow: env.AUTH_RATE_LIMIT_WINDOW } } };
 // Account creation is far rarer than login: 5 per hour per client IP limits scripted sign-ups
@@ -31,13 +33,18 @@ const registerRateLimit = { config: { rateLimit: { max: 5, timeWindow: "1 hour" 
 const otpRateLimit = { config: { rateLimit: { max: env.OTP_RATE_LIMIT_MAX, timeWindow: env.OTP_RATE_LIMIT_WINDOW } } };
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
-  const controller = createAuthController(createAuthService(app.prisma, { log: app.log }));
+  const controller = createAuthController(createAuthService(app.prisma, { log: app.log }), createSessionService(app.prisma));
 
   app.get("/api/v1/auth/google", { schema: googleAuthorizeRouteSchema }, (request, reply) => controller.googleAuthorize(request, reply));
   app.get("/api/v1/auth/google/callback", { schema: googleCallbackRouteSchema }, (request, reply) => controller.googleCallback(request, reply));
   app.post("/api/v1/auth/google/exchange", { ...authRateLimit, schema: googleExchangeRouteSchema }, (request, reply) => controller.googleExchange(request, reply));
 
   app.post("/api/v1/auth/register", { ...registerRateLimit, schema: registerRouteSchema }, (request, reply) => controller.register(request, reply));
+  // Persistent customer session: renewed from an HttpOnly cookie, ended on logout. Own sites only (Origin is checked).
+  const sessionRateLimit = { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } };
+  app.post("/api/v1/auth/refresh", { ...sessionRateLimit, schema: routeSchema(["Auth"], "Renew the access token from the persistent session cookie") }, (request, reply) => controller.refresh(request, reply));
+  app.post("/api/v1/auth/logout", { ...sessionRateLimit, schema: routeSchema(["Auth"], "End the persistent session and clear its cookie") }, (request, reply) => controller.logout(request, reply));
+
   app.post("/api/v1/auth/login", { ...authRateLimit, schema: loginRouteSchema }, (request, reply) => controller.login(request, reply));
   app.post("/api/v1/auth/admin/login", { ...authRateLimit, schema: adminLoginRouteSchema }, (request, reply) => controller.adminLogin(request, reply));
 

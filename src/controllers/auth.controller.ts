@@ -1,6 +1,8 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { env } from "../config/env.js";
 import type { AuthService } from "../services/auth.service.js";
+import type { SessionService } from "../services/session.service.js";
+import { clearedSessionCookie, originAllowed, readSessionCookie, sessionCookie } from "../utils/session-cookie.js";
 import type { AdminLoginInput, AuthenticatedUser, LoginInput, RegisterInput, Role, SafeUser } from "../types/auth.types.js";
 import {
   clearedStateCookie,
@@ -12,13 +14,29 @@ import {
   verifyOAuthState,
 } from "../utils/google-oauth.tokens.js";
 
-async function issueToken(reply: FastifyReply, user: { id: string; name: string; email: string; role: Role }) {
-  // An administrator's session is short (2 hours, customers keep the 8-hour default): a stolen admin token is useful for
-  // far less time. Deactivating the account ends it at once (requireAdmin reads isActive from the database).
-  const token = await reply.jwtSign({ role: user.role }, { sign: { sub: user.id, ...(user.role === "ADMIN" ? { expiresIn: "2h" } : {}) } });
+// Access tokens are short. An administrator's lasts 2 hours (a stolen admin token is useful for far less time; deactivating
+// the account ends it at once, requireAdmin reads isActive from the database). A customer's lasts 30 minutes and is
+// renewed silently from the persistent session cookie (POST /auth/refresh), so the shopper stays signed in without a
+// long-lived token ever sitting in the page.
+export const CUSTOMER_TOKEN_TTL = "30m";
+
+async function signAccessToken(reply: FastifyReply, user: { id: string; role: Role }) {
+  return reply.jwtSign({ role: user.role }, { sign: { sub: user.id, expiresIn: user.role === "ADMIN" ? "2h" : CUSTOMER_TOKEN_TTL } });
+}
+
+async function issueToken(sessions: SessionService, request: FastifyRequest, reply: FastifyReply, user: { id: string; name: string; email: string; role: Role }) {
+  const token = await signAccessToken(reply, user);
+  // Customers also get a persistent session (an HttpOnly cookie); administrators never do.
+  if (user.role === "CUSTOMER") {
+    const session = await sessions.start(user.id, request.headers["user-agent"] ?? null);
+    reply.header("set-cookie", sessionCookie(session.token, session.expiresAt));
+  }
   const authenticatedUser: AuthenticatedUser = { id: user.id, name: user.name, email: user.email, role: user.role };
   return { token, user: authenticatedUser };
 }
+
+const sessionInvalid = () => Object.assign(new Error("Your session has ended; please sign in again"), { statusCode: 401, code: "SESSION_INVALID" });
+const originRefused = () => Object.assign(new Error("Request not allowed from this origin"), { statusCode: 403, code: "ORIGIN_NOT_ALLOWED" });
 
 // Error codes the frontend callback page may receive; anything else is reported as GOOGLE_AUTH_FAILED.
 const GOOGLE_CALLBACK_ERRORS = new Set([
@@ -37,7 +55,7 @@ function frontendCallbackUrl(params: Record<string, string>): string {
   return url.toString();
 }
 
-export function createAuthController(service: AuthService) {
+export function createAuthController(service: AuthService, sessions: SessionService) {
   return {
     async register(request: FastifyRequest, reply: FastifyReply) {
       const user: SafeUser = await service.register(request.body as RegisterInput);
@@ -47,12 +65,12 @@ export function createAuthController(service: AuthService) {
 
     async login(request: FastifyRequest, reply: FastifyReply) {
       const user = await service.login(request.body as LoginInput);
-      return { success: true, data: await issueToken(reply, user) };
+      return { success: true, data: await issueToken(sessions, request, reply, user) };
     },
 
     async adminLogin(request: FastifyRequest, reply: FastifyReply) {
       const user = await service.adminLogin(request.body as AdminLoginInput);
-      return { success: true, data: await issueToken(reply, user) };
+      return { success: true, data: await issueToken(sessions, request, reply, user) };
     },
 
     googleAuthorize(request: FastifyRequest, reply: FastifyReply) {
@@ -87,7 +105,7 @@ export function createAuthController(service: AuthService) {
       const { code, codeVerifier } = request.body as { code: string; codeVerifier: string };
       const userId = verifyExchangeCode(request.server, code, codeVerifier);
       const user = await service.getActiveUserForGoogleExchange(userId);
-      return { success: true, data: await issueToken(reply, user) };
+      return { success: true, data: await issueToken(sessions, request, reply, user) };
     },
 
     async customerMe(request: FastifyRequest) {
@@ -110,7 +128,32 @@ export function createAuthController(service: AuthService) {
     async verifyLoginOtp(request: FastifyRequest, reply: FastifyReply) {
       const { email, otp } = request.body as { email: string; otp: string };
       const user = await service.verifyLoginOtp(email, otp);
-      return { success: true, data: await issueToken(reply, user) };
+      return { success: true, data: await issueToken(sessions, request, reply, user) };
+    },
+
+    // Silent sign-in for a returning shopper: the persistent-session cookie is exchanged for a fresh access token (and a
+    // rotated cookie). Only our own sites may call it; an invalid, expired or replayed session clears the cookie.
+    async refresh(request: FastifyRequest, reply: FastifyReply) {
+      if (!originAllowed(request.headers.origin)) throw originRefused();
+      const rotated = await sessions.rotate(readSessionCookie(request.headers.cookie), request.headers["user-agent"] ?? null);
+      const user = rotated ? await request.server.prisma.user.findUnique({ where: { id: rotated.userId }, select: { id: true, name: true, email: true, role: true, isActive: true } }) : null;
+      if (!rotated || !user || !user.isActive || user.role !== "CUSTOMER") {
+        if (rotated) await sessions.revokeFamilyOf(rotated.session.token);
+        reply.header("set-cookie", clearedSessionCookie());
+        throw sessionInvalid();
+      }
+      reply.header("set-cookie", sessionCookie(rotated.session.token, rotated.session.expiresAt));
+      reply.header("cache-control", "no-store");
+      const authenticatedUser: AuthenticatedUser = { id: user.id, name: user.name, email: user.email, role: user.role };
+      return { success: true, data: { token: await signAccessToken(reply, user), user: authenticatedUser } };
+    },
+
+    // Signs the shopper out everywhere this session runs: the cookie's family is revoked and the cookie cleared.
+    async logout(request: FastifyRequest, reply: FastifyReply) {
+      if (!originAllowed(request.headers.origin)) throw originRefused();
+      await sessions.revokeFamilyOf(readSessionCookie(request.headers.cookie));
+      reply.header("set-cookie", clearedSessionCookie());
+      return { success: true, data: { loggedOut: true } };
     },
 
     async forgotPasswordSendOtp(request: FastifyRequest) {
