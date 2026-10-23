@@ -70,6 +70,14 @@ Do not `gcloud run services replace deploy/cloudrun/service.yaml` unless it has 
 `gcloud run services describe chamaro-api --region $R --format export`: replace drops any setting missing from the
 file and moves all traffic to the new revision at once.
 
+## Coupon and delivery pricing
+
+`WELCOME10` discounts Boss chairs by 10%, and `WELCOME5` discounts chairs by 5%. Each signed-in customer account may
+redeem each code once; the order transaction recalculates the discount from current catalogue prices and records the
+code and amount. Standard delivery is free for orders with at least two chair units; express delivery remains charged.
+Chair eligibility is determined from the product name and category name/slug. Migration `0018_coupons_and_chair_shipping`
+adds the order fields and uniqueness constraint; follow the backup and migration steps above before deploying its API image.
+
 ## Email outbox
 
 Order, shipment, cancellation and password-changed emails are written to the `EmailNotification` table in the same

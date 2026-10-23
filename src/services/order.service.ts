@@ -2,7 +2,11 @@ import type { FastifyBaseLogger } from "fastify";
 import { Prisma, type PrismaClient } from "../../generated/prisma/client.js";
 import { httpError, pageMeta } from "../shared/http.js";
 import {
+  chairCount,
   computeTotals,
+  couponCode as normalizeCouponCode,
+  COUPONS,
+  eligibleCouponMinor,
   fromMinor,
   mergeCartLines,
   toMinor,
@@ -80,6 +84,7 @@ export function presentOrder<T extends OrderRow>(order: T, audience: "customer" 
     ...rest,
     shipment: audience === "admin" ? shipment : customerShipment(shipment),
     subtotal: money(order.subtotal),
+    discountTotal: money(order.discountTotal),
     shippingTotal: money(order.shippingTotal),
     total: money(order.total),
     shippingAddress: shippingAddressSnapshot,
@@ -88,7 +93,7 @@ export function presentOrder<T extends OrderRow>(order: T, audience: "customer" 
 }
 
 // The fields of a presented order that the customer emails use.
-type PresentedOrder = { id: string; createdAt: Date; subtotal: string; shippingTotal: string; total: string; shippingMethod: string | null; items: { productName: string | null; variantName: string | null; quantity: number; lineTotal: string }[]; shippingAddress: unknown };
+type PresentedOrder = { id: string; createdAt: Date; subtotal: string; discountTotal: string; couponCode: string | null; shippingTotal: string; total: string; shippingMethod: string | null; items: { productName: string | null; variantName: string | null; quantity: number; lineTotal: string }[]; shippingAddress: unknown };
 
 export function emailParts(order: Pick<PresentedOrder, "items" | "shippingAddress">) {
   return {
@@ -139,7 +144,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
   async function readCart(db: Db, customerId: string) {
     const cart = await db.cart.findUnique({
       where: { customerId },
-      include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true, images: { orderBy: { position: "asc" }, take: 1 } } }, variant: true } } },
+      include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true, images: { orderBy: { position: "asc" }, take: 1 }, category: { select: { slug: true, name: true } } } }, variant: true } } },
     });
     const items = (cart?.items ?? []).map((item) => {
       const unitMinor = unitPriceMinor(item.product, item.variant);
@@ -152,7 +157,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
         productId: item.productId,
         variantId: item.variantId,
         quantity: item.quantity,
-        product: { id: item.product.id, name: item.product.name, slug: item.product.slug, image: item.product.images[0]?.mediaId ? `/api/v1/media/${item.product.images[0].mediaId}` : (item.product.images[0]?.url ?? null) },
+        product: { id: item.product.id, name: item.product.name, slug: item.product.slug, category: item.product.category.slug, image: item.product.images[0]?.mediaId ? `/api/v1/media/${item.product.images[0].mediaId}` : (item.product.images[0]?.url ?? null) },
         variant: item.variant ? { id: item.variant.id, name: item.variant.name, sku: item.variant.sku } : null,
         unitPrice: fromMinor(unitMinor),
         lineTotal: fromMinor(unitMinor * item.quantity),
@@ -170,6 +175,31 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
     async getCart(userId: string) {
       const customer = await customerFor(userId);
       return readCart(prisma, customer.id);
+    },
+
+    async validateCoupon(userId: string, input: { code: string; items: CartLineInput[] }) {
+      const code = normalizeCouponCode(input.code);
+      if (!code) throw httpError(400, "COUPON_INVALID", "This coupon code is not valid");
+      const customer = await customerFor(userId);
+      const redeemed = await prisma.retailOrder.findFirst({ where: { customerId: customer.id, couponCode: code }, select: { id: true } });
+      if (redeemed) throw httpError(409, "COUPON_ALREADY_USED", "This coupon has already been used on your account");
+      const merged = mergeCartLines(input.items);
+      if (merged.length === 0) throw httpError(400, "CART_EMPTY", "Your cart is empty");
+      const products = await prisma.product.findMany({
+        where: { id: { in: [...new Set(merged.map((line) => line.productId))] } },
+        include: { category: { select: { slug: true, name: true } }, variants: { where: { status: "ACTIVE" } } },
+      });
+      const byId = new Map(products.map((product) => [product.id, product]));
+      const lines = merged.map((item) => {
+        const product = byId.get(item.productId);
+        if (!product || product.status !== "ACTIVE") throw httpError(409, "ITEM_UNAVAILABLE", "A product in your cart is no longer available");
+        const variant = item.variantId ? product.variants.find((candidate) => candidate.id === item.variantId) : null;
+        if (item.variantId && !variant) throw httpError(409, "ITEM_UNAVAILABLE", `${product.name} is no longer available`);
+        return { name: product.name, category: product.category, unitMinor: unitPriceMinor(product, variant), quantity: item.quantity };
+      });
+      const discountMinor = eligibleCouponMinor(code, lines);
+      if (discountMinor === 0) throw httpError(400, "COUPON_NOT_APPLICABLE", `${code} does not apply to the items in your cart`);
+      return { code, percentOff: COUPONS[code].percentOff, discountTotal: fromMinor(discountMinor) };
     },
 
     // Replaces the whole cart. Every line must be an ACTIVE product (and ACTIVE variant of that product); a line
@@ -220,7 +250,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
 
     // ---- orders ----------------------------------------------------------------------------------------------
 
-    async createOrder(userId: string, input: { idempotencyKey: string; addressId: string; shippingMethod: ShippingMethod; note?: string }) {
+    async createOrder(userId: string, input: { idempotencyKey: string; addressId: string; shippingMethod: ShippingMethod; note?: string; couponCode?: string }) {
       const customer = await customerFor(userId);
 
       const result = await retryOnConflict(() => prisma.$transaction(
@@ -237,7 +267,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
 
           const cart = await tx.cart.findUnique({
             where: { customerId: customer.id },
-            include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true } }, variant: true } } },
+            include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true, category: { select: { slug: true, name: true } } } }, variant: true } } },
           });
           if (!cart || cart.items.length === 0) throw httpError(400, "CART_EMPTY", "Your cart is empty");
 
@@ -261,7 +291,27 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
           }
 
           const lines = cart.items.map((item) => ({ item, unitMinor: unitPriceMinor(item.product, item.variant) }));
-          const totals = computeTotals(lines.map((line) => ({ unitMinor: line.unitMinor, quantity: line.item.quantity })), input.shippingMethod);
+          const code = normalizeCouponCode(input.couponCode);
+          if (input.couponCode && !code) throw httpError(400, "COUPON_INVALID", "This coupon code is not valid");
+          let discountMinor = 0;
+          if (code) {
+            const redeemed = await tx.retailOrder.findFirst({ where: { customerId: customer.id, couponCode: code }, select: { id: true } });
+            if (redeemed) throw httpError(409, "COUPON_ALREADY_USED", "This coupon has already been used on your account");
+            discountMinor = eligibleCouponMinor(code, lines.map(({ item, unitMinor }) => ({
+              name: item.product.name,
+              category: item.product.category,
+              unitMinor,
+              quantity: item.quantity,
+            })));
+            if (discountMinor === 0) throw httpError(400, "COUPON_NOT_APPLICABLE", `${code} does not apply to the items in your cart`);
+          }
+          const chairs = chairCount(lines.map(({ item }) => ({ name: item.product.name, category: item.product.category, quantity: item.quantity })));
+          const totals = computeTotals(
+            lines.map((line) => ({ unitMinor: line.unitMinor, quantity: line.item.quantity })),
+            input.shippingMethod,
+            chairs,
+            discountMinor,
+          );
 
           const order = await tx.retailOrder.create({
             data: {
@@ -269,6 +319,8 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
               status: "PENDING",
               paymentStatus: "UNPAID",
               subtotal: fromMinor(totals.subtotalMinor),
+              discountTotal: fromMinor(totals.discountMinor),
+              couponCode: code,
               shippingTotal: fromMinor(totals.shippingMinor),
               total: fromMinor(totals.totalMinor),
               shippingMethod: input.shippingMethod,
@@ -293,7 +345,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
           await tx.cartItem.deleteMany({ where: { id: { in: cart.items.map((item) => item.id) } } });
           const presented = presentOrder(order);
           const notification = await enqueueOrderEmail(tx, userId, order.id, "placed", (customerName) =>
-            orderPlacedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, ...emailParts(presented) }),
+            orderPlacedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, discountTotal: presented.discountTotal, couponCode: presented.couponCode, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, ...emailParts(presented) }),
           );
           return { order: presented, replay: false, notification };
         },

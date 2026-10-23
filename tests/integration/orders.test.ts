@@ -44,11 +44,11 @@ class Shop {
   }
 
   // A product with an optional stock level (undefined = stock not tracked) and variants.
-  async product(options: { price?: string; stock?: number; status?: "ACTIVE" | "DRAFT" | "ARCHIVED"; variants?: { name: string; price?: string; status?: "ACTIVE" | "ARCHIVED" }[] } = {}) {
+  async product(options: { name?: string; price?: string; stock?: number; status?: "ACTIVE" | "DRAFT" | "ARCHIVED"; variants?: { name: string; price?: string; status?: "ACTIVE" | "ARCHIVED" }[] } = {}) {
     const n = ++this.counter;
     const created = await this.app.prisma.product.create({
       data: {
-        name: `Chair ${n} ${this.unique}`,
+        name: options.name ?? `Chair ${n} ${this.unique}`,
         slug: `chair-${n}-${this.unique}`,
         price: options.price ?? "1000.00",
         status: options.status ?? "ACTIVE",
@@ -86,6 +86,10 @@ class Shop {
 
   order(headers: Record<string, string>, body: object, key = `key-${randomBytes(8).toString("hex")}`) {
     return this.app.inject({ method: "POST", url: "/api/v1/orders", headers: { ...headers, "idempotency-key": key }, payload: body });
+  }
+
+  validateCoupon(headers: Record<string, string>, body: object) {
+    return this.app.inject({ method: "POST", url: "/api/v1/coupons/validate", headers, payload: body });
   }
 
   async reserved(productId: string) {
@@ -289,7 +293,7 @@ test("an order is priced from the database, reserves stock, empties the cart and
     assert.equal(placed.statusCode, 201, placed.body);
     const order = placed.json().data;
     assert.deepEqual([order.status, order.paymentStatus], ["PENDING", "UNPAID"]);
-    assert.deepEqual([order.subtotal, order.shippingTotal, order.total], ["2200.00", "499.00", "2699.00"]);
+    assert.deepEqual([order.subtotal, order.discountTotal, order.shippingTotal, order.total], ["2200.00", "0.00", "0.00", "2200.00"]);
     assert.equal(order.note, "Leave at the gate");
     assert.equal(order.items.length, 1);
     assert.deepEqual([order.items[0].quantity, order.items[0].unitPrice, order.items[0].lineTotal, order.items[0].productName], [2, "1100.00", "2200.00", product.name]);
@@ -299,7 +303,7 @@ test("an order is priced from the database, reserves stock, empties the cart and
     assert.deepEqual((await app.inject({ method: "GET", url: "/api/v1/cart", headers: buyer.headers })).json().data.items, [], "the cart is emptied");
     const list = (await app.inject({ method: "GET", url: "/api/v1/orders", headers: buyer.headers })).json();
     assert.deepEqual([list.data.length, list.meta.total, list.data[0].id], [1, 1, order.id]);
-    assert.equal((await app.inject({ method: "GET", url: `/api/v1/orders/${order.id}`, headers: buyer.headers })).json().data.total, "2699.00");
+    assert.equal((await app.inject({ method: "GET", url: `/api/v1/orders/${order.id}`, headers: buyer.headers })).json().data.total, "2200.00");
 
     // Empty cart now.
     const again = await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" });
@@ -307,7 +311,7 @@ test("an order is priced from the database, reserves stock, empties the cart and
     assert.equal(again.json().error.code, "CART_EMPTY");
   }));
 
-test("free standard shipping from the threshold, express never free, variant and untracked products work", { skip: skipReason }, () =>
+test("two chair units get free standard shipping, express never does, variants and untracked products work", { skip: skipReason }, () =>
   withShop(async (shop) => {
     const untracked = await shop.product({ price: "6000.00" }); // no inventory row: stock not tracked
     const variants = await shop.product({ price: "3000.00", stock: 4, variants: [{ name: "Walnut", price: "2000.00" }] });
@@ -323,6 +327,43 @@ test("free standard shipping from the threshold, express never free, variant and
     await shop.putCart(buyer.headers, [{ productId: untracked.id, quantity: 1 }]);
     const express = (await shop.order(buyer.headers, { addressId: address, shippingMethod: "express" })).json().data;
     assert.deepEqual([express.subtotal, express.shippingTotal, express.total], ["6000.00", "999.00", "6999.00"]);
+  }));
+
+test("WELCOME coupons discount only eligible chairs and can each be redeemed once per account", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const bossChair = await shop.product({ name: "Boss Chair", price: "1000.00" });
+    const diningChair = await shop.product({ name: "Dining Chair", price: "1000.00" });
+    const desk = await shop.product({ name: "Office Desk", price: "1000.00" });
+    const buyer = await shop.customer();
+    const address = (await shop.address(buyer.headers)).json().data.id;
+    const bossItems = [{ productId: bossChair.id, quantity: 1 }, { productId: desk.id, quantity: 1 }];
+    const bossQuote = await shop.validateCoupon(buyer.headers, { code: "welcome10", items: bossItems });
+    assert.equal(bossQuote.statusCode, 200, bossQuote.body);
+    assert.deepEqual(bossQuote.json().data, { code: "WELCOME10", percentOff: 10, discountTotal: "100.00" });
+    await shop.putCart(buyer.headers, bossItems);
+    const bossOrder = await shop.order(buyer.headers, { addressId: address, shippingMethod: "standard", couponCode: "WELCOME10" });
+    assert.equal(bossOrder.statusCode, 201, bossOrder.body);
+    assert.deepEqual(
+      [bossOrder.json().data.couponCode, bossOrder.json().data.discountTotal, bossOrder.json().data.shippingTotal, bossOrder.json().data.total],
+      ["WELCOME10", "100.00", "499.00", "2399.00"],
+    );
+
+    const diningItems = [{ productId: diningChair.id, quantity: 2 }];
+    const generalQuote = await shop.validateCoupon(buyer.headers, { code: "WELCOME5", items: diningItems });
+    assert.equal(generalQuote.statusCode, 200, generalQuote.body);
+    assert.deepEqual(generalQuote.json().data, { code: "WELCOME5", percentOff: 5, discountTotal: "100.00" });
+    await shop.putCart(buyer.headers, diningItems);
+    const diningOrder = await shop.order(buyer.headers, { addressId: address, shippingMethod: "standard", couponCode: "WELCOME5" });
+    assert.equal(diningOrder.statusCode, 201, diningOrder.body);
+    assert.deepEqual(
+      [diningOrder.json().data.discountTotal, diningOrder.json().data.shippingTotal, diningOrder.json().data.total],
+      ["100.00", "0.00", "1900.00"],
+    );
+
+    await shop.putCart(buyer.headers, [{ productId: bossChair.id, quantity: 1 }]);
+    const reused = await shop.order(buyer.headers, { addressId: address, shippingMethod: "standard", couponCode: "WELCOME10" });
+    assert.equal(reused.statusCode, 409);
+    assert.equal(reused.json().error.code, "COUPON_ALREADY_USED");
   }));
 
 test("an order that cannot be fulfilled is rejected whole: nothing is reserved and no order exists", { skip: skipReason }, () =>

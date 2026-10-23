@@ -146,7 +146,7 @@ class Shop {
     return { authorization: `Bearer ${this.app.jwt.sign({ sub: user.id, role: "ADMIN" })}` };
   }
 
-  // A customer with a placed (PENDING, UNPAID) order for `quantity` of a 1000.00 product: total 1499.00 with standard shipping.
+  // A customer with a placed (PENDING, UNPAID) order for `quantity` of a 1000.00 chair.
   async placedOrder(quantity = 1, stock = 5) {
     const product = await this.product(stock);
     const customer = await this.customer();
@@ -225,8 +225,8 @@ class Shop {
 test("payment opens only after the checkout code, for the server's total, and a retry reuses the same gateway order", { skip: skipReason }, () =>
   withShop(async (shop) => {
     const { order, user, headers } = await shop.placedOrder(2);
-    assert.equal(order.total, "2499.00", "2 x 1000.00 plus 499.00 standard shipping (free only from 10000)");
-    const total = 2000_00 + 499_00;
+    assert.equal(order.total, "2000.00", "two chairs receive free standard shipping");
+    const total = 2000_00;
 
     const unverified = await shop.startPayment(headers, order.id);
     assert.deepEqual([unverified.statusCode, unverified.json().error.code], [403, "CHECKOUT_NOT_VERIFIED"]);

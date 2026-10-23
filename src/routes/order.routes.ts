@@ -41,7 +41,16 @@ const createOrderBody = {
   type: "object",
   additionalProperties: false,
   required: ["addressId", "shippingMethod"],
-  properties: { addressId: { type: "string", minLength: 1 }, shippingMethod: { type: "string", enum: SHIPPING_METHODS }, note: { type: "string", maxLength: 500 } },
+  properties: { addressId: { type: "string", minLength: 1 }, shippingMethod: { type: "string", enum: SHIPPING_METHODS }, note: { type: "string", maxLength: 500 }, couponCode: { type: "string", maxLength: 32 } },
+};
+const validateCouponBody = {
+  type: "object",
+  additionalProperties: false,
+  required: ["code", "items"],
+  properties: {
+    code: { type: "string", minLength: 1, maxLength: 32 },
+    items: cartBody.properties.items,
+  },
 };
 const idempotencyHeaders = {
   type: "object",
@@ -79,6 +88,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { success: true, data: await service.replaceCart(userId(request), items) };
   });
 
+  app.post("/api/v1/coupons/validate", { schema: routeSchema(["Coupons"], "Validate a coupon for the signed-in customer's cart", { security: bearer, body: validateCouponBody }) }, async (request) => {
+    await request.requireCustomer();
+    const body = request.body as { code: string; items: { productId: string; variantId?: string; quantity: number }[] };
+    return { success: true, data: await service.validateCoupon(userId(request), { ...body, items: body.items }) };
+  });
+
   app.delete("/api/v1/cart", { schema: routeSchema(["Cart"], "Empty the signed-in customer's cart", { security: bearer }) }, async (request, reply) => {
     await request.requireCustomer();
     await service.clearCart(userId(request));
@@ -91,9 +106,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { schema: routeSchema(["Orders"], "Place an order from the server cart (send an Idempotency-Key header; a retry returns the same order)", { security: bearer, headers: idempotencyHeaders, body: createOrderBody }) },
     async (request, reply) => {
       await request.requireCustomer();
-      const body = request.body as { addressId: string; shippingMethod: "standard" | "express"; note?: string };
+      const body = request.body as { addressId: string; shippingMethod: "standard" | "express"; note?: string; couponCode?: string };
       const key = request.headers["idempotency-key"] as string;
-      const { order, replay } = await service.createOrder(userId(request), { idempotencyKey: key, addressId: body.addressId, shippingMethod: body.shippingMethod, note: body.note?.trim() || undefined });
+      const { order, replay } = await service.createOrder(userId(request), { idempotencyKey: key, addressId: body.addressId, shippingMethod: body.shippingMethod, note: body.note?.trim() || undefined, couponCode: body.couponCode });
       reply.code(replay ? 200 : 201);
       return { success: true, data: order };
     },

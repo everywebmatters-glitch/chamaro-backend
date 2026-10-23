@@ -23,6 +23,8 @@ const order = {
     { productName: "Footrest <script>alert(1)</script>", variantName: null, quantity: 1, lineTotal: "3000.00" },
   ],
   subtotal: "27000.00",
+  discountTotal: "0.00",
+  couponCode: null,
   shippingTotal: "0.00",
   total: "27000.00",
   shippingMethod: "standard",
@@ -65,6 +67,17 @@ test("the order-placed email says plainly that payment is pending and nothing sh
   assert.match(text, /PAYMENT FOR THIS ORDER IS PENDING/);
   assert.match(text, /Payment status: Pending/);
   assert.doesNotMatch(html + text, /order is confirmed|order has been confirmed/i, "never calls the order confirmed");
+});
+
+test("order emails disclose an applied coupon and its discount", () => {
+  const discounted = { ...order, subtotal: "1000.00", discountTotal: "100.00", couponCode: "WELCOME10", total: "900.00" };
+  const placed = email.orderPlacedEmail(discounted);
+  const confirmed = email.orderConfirmedEmail({ ...discounted, paidAt: new Date("2026-10-18T10:01:00Z") });
+  for (const message of [placed, confirmed]) {
+    assert.match(message.html, /Discount \(WELCOME10\)/);
+    assert.match(message.html, /100\.00/);
+    assert.match(message.text, /Discount \(WELCOME10\): -Rs\. 100\.00/);
+  }
 });
 
 test("no email asks for a reply to the no-reply sender; order and account emails point at the contact page", () => {

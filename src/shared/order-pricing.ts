@@ -1,18 +1,53 @@
-// Money rules for orders. Pure functions: every amount is computed on the server from catalogue prices read from
-// the database; nothing a client sends (prices, totals, discounts) is ever used. Amounts are handled in paise
-// (integer hundredths of a rupee) so sums never accumulate floating-point error.
+// Money rules for orders. Pure functions: amounts are computed from catalogue prices read from the database;
+// client-supplied prices, totals and discount amounts are never used. Amounts are handled in paise (integer
+// hundredths of a rupee) so sums never accumulate floating-point error.
 
 export type ShippingMethod = "standard" | "express";
 export const SHIPPING_METHODS: ShippingMethod[] = ["standard", "express"];
 
-// PLACEHOLDER business rules, mirrored from the storefront's cart constants (webapp/app/lib/cart.ts, marked
-// "TODO: confirm with the business"). Change them here once the real shipping policy is decided.
-export const SHIPPING_RULES: Record<ShippingMethod, { priceMinor: number; freeFromMinor: number | null }> = {
-  standard: { priceMinor: 49_900, freeFromMinor: 1_000_000 },
-  express: { priceMinor: 99_900, freeFromMinor: null },
+export const SHIPPING_RULES: Record<ShippingMethod, { priceMinor: number }> = {
+  standard: { priceMinor: 49_900 },
+  express: { priceMinor: 99_900 },
 };
 
 export const MAX_LINE_QUANTITY = 99;
+export const COUPONS = {
+  WELCOME10: { percentOff: 10, eligible: "boss-chair" },
+  WELCOME5: { percentOff: 5, eligible: "chair" },
+} as const;
+
+export type CouponCode = keyof typeof COUPONS;
+
+export type CouponLine = {
+  name: string;
+  category: { slug: string; name: string };
+  unitMinor: number;
+  quantity: number;
+};
+
+export function couponCode(value: string | undefined): CouponCode | null {
+  const normalized = value?.trim().toUpperCase();
+  return normalized && Object.hasOwn(COUPONS, normalized) ? normalized as CouponCode : null;
+}
+
+function isChair(line: Pick<CouponLine, "name" | "category">): boolean {
+  return /\bchairs?\b/i.test(`${line.name} ${line.category.slug} ${line.category.name}`);
+}
+
+export function eligibleCouponMinor(code: CouponCode, lines: CouponLine[]): number {
+  const { percentOff, eligible } = COUPONS[code];
+  const eligibleMinor = lines.reduce((sum, line) => {
+    const matches = eligible === "chair"
+      ? isChair(line)
+      : isChair(line) && /\bboss\b/i.test(`${line.name} ${line.category.slug} ${line.category.name}`);
+    return matches ? sum + line.unitMinor * line.quantity : sum;
+  }, 0);
+  return Math.round(eligibleMinor * percentOff / 100);
+}
+
+export function chairCount(lines: { name: string; category: { slug: string; name: string }; quantity: number }[]): number {
+  return lines.reduce((count, line) => count + (isChair(line) ? line.quantity : 0), 0);
+}
 
 type Amount = string | number | { toString(): string };
 
@@ -32,29 +67,27 @@ export function unitPriceMinor(product: { price: Amount }, variant?: { price: Am
   return toMinor(variant?.price != null ? variant.price : product.price);
 }
 
-// TEMPORARY (launch testing): FREE_SHIPPING_FOR_ALL=true on the API makes every shipping method free for every order.
-// The storefront shows the same thing from its own FREE_SHIPPING_FOR_ALL constant (webapp/app/lib/cart.ts); change
-// both together, or the price shown and the amount charged will differ. Unset (default) = the rules above.
-export function freeShippingForAll(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.FREE_SHIPPING_FOR_ALL === "true";
-}
-
-export function shippingMinor(method: ShippingMethod, subtotalMinor: number, freeForAll = freeShippingForAll()): number {
-  if (freeForAll) return 0;
+export function shippingMinor(method: ShippingMethod, chairs: number): number {
   const rule = SHIPPING_RULES[method];
-  return rule.freeFromMinor !== null && subtotalMinor >= rule.freeFromMinor ? 0 : rule.priceMinor;
+  return method === "standard" && chairs >= 2 ? 0 : rule.priceMinor;
 }
 
 export interface OrderTotals {
   subtotalMinor: number;
+  discountMinor: number;
   shippingMinor: number;
   totalMinor: number;
 }
 
-export function computeTotals(lines: { unitMinor: number; quantity: number }[], method: ShippingMethod): OrderTotals {
+export function computeTotals(
+  lines: { unitMinor: number; quantity: number }[],
+  method: ShippingMethod,
+  chairs: number,
+  discountMinor = 0,
+): OrderTotals {
   const subtotalMinor = lines.reduce((sum, line) => sum + line.unitMinor * line.quantity, 0);
-  const shipping = shippingMinor(method, subtotalMinor);
-  return { subtotalMinor, shippingMinor: shipping, totalMinor: subtotalMinor + shipping };
+  const shipping = shippingMinor(method, chairs);
+  return { subtotalMinor, discountMinor, shippingMinor: shipping, totalMinor: subtotalMinor - discountMinor + shipping };
 }
 
 export interface CartLineInput {

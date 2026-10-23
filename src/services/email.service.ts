@@ -191,6 +191,8 @@ export type OrderEmail = {
   customerName: string;
   items: OrderEmailItem[];
   subtotal: string;
+  discountTotal: string;
+  couponCode: string | null;
   shippingTotal: string;
   total: string;
   shippingMethod: string | null;
@@ -239,6 +241,9 @@ function addressText(address: OrderEmailAddress | null): string | null {
 // pending and that nothing is processed or shipped until it is complete.
 export function orderPlacedEmail(order: OrderEmail): EmailMessage {
   const shippingLabel = `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
+  const discountLabel = `Discount${order.couponCode ? ` (${escapeHtml(order.couponCode)})` : ""}`;
+  const discountRow = Number(order.discountTotal) > 0 ? row(discountLabel, `-${rupees(order.discountTotal)}`) : "";
+  const discountText = Number(order.discountTotal) > 0 ? `\n${discountLabel}: -${rupeesText(order.discountTotal)}` : "";
   return {
     subject: `Chamaro order ${order.id}: payment pending`,
     html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, thank you for placing an order with Chamaro.</p>
@@ -246,6 +251,7 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
       <p style="${TEXT}"><strong>Order ${escapeHtml(order.id)}</strong><br><span style="color:#78716c;font-size:13px;">Placed ${formatIstDate(order.createdAt)}</span></p>
       ${table(`${itemRows(order.items)}
         ${row("Subtotal", rupees(order.subtotal))}
+        ${discountRow}
         ${row(escapeHtml(shippingLabel), rupees(order.shippingTotal))}
         ${row("Total", rupees(order.total), TOTAL_CELL)}
         ${row("Payment status", "Pending")}`)}
@@ -255,7 +261,7 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
       `Hi ${order.customerName}, thank you for placing an order with Chamaro.`,
       "PAYMENT FOR THIS ORDER IS PENDING. Your order is not confirmed yet, and we will not process or ship it until payment is complete.",
       `Order ${order.id}\nPlaced ${formatIstDate(order.createdAt)}`,
-      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal: ${rupeesText(order.total)}\nPayment status: Pending`,
+      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}${discountText}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal: ${rupeesText(order.total)}\nPayment status: Pending`,
       addressText(order.shippingAddress),
       `Questions about your order? Contact us at ${contactUrl()} and quote your order reference.`,
     ]),
@@ -265,12 +271,16 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
 // Sent once the payment has been read back from Razorpay as captured for the full order total.
 export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): EmailMessage {
   const shippingLabel = `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
+  const discountLabel = `Discount${order.couponCode ? ` (${escapeHtml(order.couponCode)})` : ""}`;
+  const discountRow = Number(order.discountTotal) > 0 ? row(discountLabel, `-${rupees(order.discountTotal)}`) : "";
+  const discountText = Number(order.discountTotal) > 0 ? `\n${discountLabel}: -${rupeesText(order.discountTotal)}` : "";
   return {
     subject: `Chamaro order ${order.id} confirmed: payment received`,
     html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, we've received your payment and your order is confirmed.</p>
       <p style="${TEXT}"><strong>Order ${escapeHtml(order.id)}</strong><br><span style="color:#78716c;font-size:13px;">Paid ${formatIstDate(order.paidAt)}</span></p>
       ${table(`${itemRows(order.items)}
         ${row("Subtotal", rupees(order.subtotal))}
+        ${discountRow}
         ${row(escapeHtml(shippingLabel), rupees(order.shippingTotal))}
         ${row("Total paid", rupees(order.total), TOTAL_CELL)}`)}
       ${addressBlock(order.shippingAddress)}
@@ -279,7 +289,7 @@ export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): Email
     text: textLayout([
       `Hi ${order.customerName}, we've received your payment and your order is confirmed.`,
       `Order ${order.id}\nPaid ${formatIstDate(order.paidAt)}`,
-      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal paid: ${rupeesText(order.total)}`,
+      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}${discountText}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal paid: ${rupeesText(order.total)}`,
       addressText(order.shippingAddress),
       "We'll email you again when your order ships.",
       `Questions about your order? Contact us at ${contactUrl()} and quote your order reference.`,

@@ -172,7 +172,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
           if (payment.mode === "live") await queueCourierBooking(tx, order.id);
           const presented = presentOrder(order);
           result.notification = await enqueueOrderEmail(tx, order.customer.userId, order.id, "confirmed", (customerName) =>
-            orderConfirmedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, paidAt: now, ...emailParts(presented) }),
+            orderConfirmedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, discountTotal: presented.discountTotal, couponCode: presented.couponCode, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, paidAt: now, ...emailParts(presented) }),
           );
           result.outcome = "paid";
           options.log?.info({ paymentId: payment.id, orderId: order.id }, "Order paid");
