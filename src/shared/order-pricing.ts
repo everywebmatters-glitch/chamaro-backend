@@ -5,16 +5,56 @@
 export type ShippingMethod = "standard" | "express";
 export const SHIPPING_METHODS: ShippingMethod[] = ["standard", "express"];
 
-// PLACEHOLDER business rules, mirrored from the storefront's cart constants (webapp/app/lib/cart.ts, marked
-// "TODO: confirm with the business"). Change them here once the real shipping policy is decided.
-export const SHIPPING_RULES: Record<ShippingMethod, { priceMinor: number; freeFromMinor: number | null }> = {
-  standard: { priceMinor: 49_900, freeFromMinor: 1_000_000 },
-  express: { priceMinor: 99_900, freeFromMinor: null },
+// Keep these rules aligned with the storefront's cart pricing.
+export const SHIPPING_RULES: Record<ShippingMethod, { priceMinor: number }> = {
+  standard: { priceMinor: 49_900 },
+  express: { priceMinor: 99_900 },
 };
 
 export const MAX_LINE_QUANTITY = 99;
 
+export const COUPONS = {
+  WELCOME10: { label: "10% off Boss chairs", percentOff: 10, appliesTo: "boss-chair" },
+  WELCOME5: { label: "5% off chairs", percentOff: 5, appliesTo: "chair" },
+} as const;
+
+export type CouponCode = keyof typeof COUPONS;
+
 type Amount = string | number | { toString(): string };
+type PricedLine = {
+  unitMinor: number;
+  quantity: number;
+  productName?: string | null;
+  categoryName?: string | null;
+  categorySlug?: string | null;
+};
+
+export function normaliseCouponCode(code: string): CouponCode | undefined {
+  const normalised = code.trim().toUpperCase();
+  return Object.hasOwn(COUPONS, normalised) ? (normalised as CouponCode) : undefined;
+}
+
+function productTerms(line: Pick<PricedLine, "productName" | "categoryName" | "categorySlug">): string {
+  return [line.productName, line.categoryName, line.categorySlug].filter(Boolean).join(" ").toLowerCase();
+}
+
+export function isChairLine(line: Pick<PricedLine, "productName" | "categoryName" | "categorySlug">): boolean {
+  return /\bchairs?\b/.test(productTerms(line)) || /\bboss\b/.test(productTerms(line));
+}
+
+export function isBossChairLine(line: Pick<PricedLine, "productName" | "categoryName" | "categorySlug">): boolean {
+  const terms = productTerms(line);
+  return /\bboss\b/.test(terms) && isChairLine(line);
+}
+
+export function couponDiscountMinor(lines: PricedLine[], code: CouponCode): number {
+  const coupon = COUPONS[code];
+  const eligibleSubtotal = lines.reduce((sum, line) => {
+    const eligible = coupon.appliesTo === "boss-chair" ? isBossChairLine(line) : isChairLine(line);
+    return eligible ? sum + line.unitMinor * line.quantity : sum;
+  }, 0);
+  return Math.round((eligibleSubtotal * coupon.percentOff) / 100);
+}
 
 export function toMinor(value: Amount): number {
   const minor = Math.round(Number(value.toString()) * 100);
@@ -32,21 +72,29 @@ export function unitPriceMinor(product: { price: Amount }, variant?: { price: Am
   return toMinor(variant?.price != null ? variant.price : product.price);
 }
 
-export function shippingMinor(method: ShippingMethod, subtotalMinor: number): number {
+export function shippingMinor(method: ShippingMethod, chairCount: number): number {
   const rule = SHIPPING_RULES[method];
-  return rule.freeFromMinor !== null && subtotalMinor >= rule.freeFromMinor ? 0 : rule.priceMinor;
+  return method === "standard" && chairCount > 1 ? 0 : rule.priceMinor;
 }
 
 export interface OrderTotals {
   subtotalMinor: number;
+  discountMinor: number;
   shippingMinor: number;
   totalMinor: number;
 }
 
-export function computeTotals(lines: { unitMinor: number; quantity: number }[], method: ShippingMethod): OrderTotals {
+export function computeTotals(lines: PricedLine[], method: ShippingMethod, couponCode?: CouponCode): OrderTotals {
   const subtotalMinor = lines.reduce((sum, line) => sum + line.unitMinor * line.quantity, 0);
-  const shipping = shippingMinor(method, subtotalMinor);
-  return { subtotalMinor, shippingMinor: shipping, totalMinor: subtotalMinor + shipping };
+  const discount = couponCode ? couponDiscountMinor(lines, couponCode) : 0;
+  const chairCount = lines.reduce((sum, line) => sum + (isChairLine(line) ? line.quantity : 0), 0);
+  const shipping = shippingMinor(method, chairCount);
+  return {
+    subtotalMinor,
+    discountMinor: discount,
+    shippingMinor: shipping,
+    totalMinor: subtotalMinor - discount + shipping,
+  };
 }
 
 export interface CartLineInput {

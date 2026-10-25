@@ -15,6 +15,8 @@ The API uses `Authorization: Bearer <token>` for administrator routes. Login at 
 
 Customers log in at `POST /api/v1/auth/login` and read their profile at `GET /api/v1/auth/me` (active `CUSTOMER` tokens only). Tokens last 8 hours; there is no refresh or server-side logout.
 
+Retail coupons are validated for signed-in customers at `POST /api/v1/coupons/validate`. `WELCOME10` discounts Boss chair lines by 10%; `WELCOME5` discounts chair lines by 5%. The code is recorded on an order and is usable once per customer account. Standard delivery is free when the order contains at least two chairs; express delivery remains paid.
+
 ### Google sign-in (browser flow)
 
 1. The frontend creates a PKCE `code_verifier` (43–128 chars, kept in the browser) and navigates to `GET /api/v1/auth/google?code_challenge=<base64url(SHA-256(verifier))>`.

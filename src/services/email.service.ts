@@ -191,6 +191,8 @@ export type OrderEmail = {
   customerName: string;
   items: OrderEmailItem[];
   subtotal: string;
+  discountTotal?: string;
+  discountCode?: string | null;
   shippingTotal: string;
   total: string;
   shippingMethod: string | null;
@@ -237,6 +239,13 @@ function addressText(address: OrderEmailAddress | null): string | null {
 // pending and that nothing is processed or shipped until it is complete.
 export function orderPlacedEmail(order: OrderEmail): EmailMessage {
   const shippingLabel = `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
+  const discountLabel = order.discountCode ? `Discount (${order.discountCode})` : "Discount";
+  const discountRow = order.discountTotal && Number(order.discountTotal) > 0
+    ? row(escapeHtml(discountLabel), `−${rupees(order.discountTotal)}`)
+    : "";
+  const discountText = order.discountTotal && Number(order.discountTotal) > 0
+    ? `\n${discountLabel}: -${rupeesText(order.discountTotal)}`
+    : "";
   return {
     subject: `Chamaro order ${order.id}: payment pending`,
     html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, thank you for placing an order with Chamaro.</p>
@@ -244,6 +253,7 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
       <p style="${TEXT}"><strong>Order ${escapeHtml(order.id)}</strong><br><span style="color:#78716c;font-size:13px;">Placed ${formatIstDate(order.createdAt)}</span></p>
       ${table(`${itemRows(order.items)}
         ${row("Subtotal", rupees(order.subtotal))}
+        ${discountRow}
         ${row(escapeHtml(shippingLabel), rupees(order.shippingTotal))}
         ${row("Total", rupees(order.total), TOTAL_CELL)}
         ${row("Payment status", "Pending")}`)}
@@ -253,7 +263,7 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
       `Hi ${order.customerName}, thank you for placing an order with Chamaro.`,
       "PAYMENT FOR THIS ORDER IS PENDING. Your order is not confirmed yet, and we will not process or ship it until payment is complete.",
       `Order ${order.id}\nPlaced ${formatIstDate(order.createdAt)}`,
-      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal: ${rupeesText(order.total)}\nPayment status: Pending`,
+      `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}${discountText}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal: ${rupeesText(order.total)}\nPayment status: Pending`,
       addressText(order.shippingAddress),
       `Questions about your order? Contact us at ${contactUrl()} and quote your order reference.`,
     ]),

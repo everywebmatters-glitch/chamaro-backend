@@ -3,12 +3,16 @@ import { Prisma, type PrismaClient } from "../../generated/prisma/client.js";
 import { httpError, pageMeta } from "../shared/http.js";
 import {
   computeTotals,
+  COUPONS,
+  couponDiscountMinor,
   fromMinor,
   mergeCartLines,
+  normaliseCouponCode,
   toMinor,
   unitPriceMinor,
   unitsPerProduct,
   type CartLineInput,
+  type CouponCode,
   type ShippingMethod,
 } from "../shared/order-pricing.js";
 import { orderCancelledEmail, orderPlacedEmail, shipmentEmail, type EmailMessage, type OrderEmailAddress } from "./email.service.js";
@@ -56,6 +60,7 @@ export function presentOrder<T extends OrderRow>(order: T) {
   return {
     ...rest,
     subtotal: money(order.subtotal),
+    discountTotal: money(order.discountTotal),
     shippingTotal: money(order.shippingTotal),
     total: money(order.total),
     shippingAddress: shippingAddressSnapshot,
@@ -132,6 +137,53 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
       return readCart(prisma, customer.id);
     },
 
+    async validateCoupon(userId: string, input: { code: string; items: CartLineInput[] }) {
+      const customer = await customerFor(userId);
+      const code = normaliseCouponCode(input.code);
+      if (!code) throw httpError(400, "COUPON_INVALID", "This coupon code isn't valid");
+
+      const redeemed = await prisma.retailOrder.findFirst({
+        where: { customerId: customer.id, discountCode: code },
+        select: { id: true },
+      });
+      if (redeemed) throw httpError(409, "COUPON_ALREADY_USED", "This coupon has already been used on your account");
+
+      if (input.items.length === 0) throw httpError(400, "COUPON_NOT_APPLICABLE", "Add an eligible chair to your cart first");
+      const productIds = [...new Set(input.items.map((item) => item.productId))];
+      const products = await prisma.product.findMany({
+        where: { id: { in: productIds }, status: "ACTIVE" },
+        include: { category: true, variants: true },
+      });
+      const productById = new Map(products.map((product) => [product.id, product]));
+      if (products.length !== productIds.length) throw httpError(400, "ITEM_UNAVAILABLE", "A product in your cart is no longer available");
+
+      const mergedItems = mergeCartLines(input.items);
+      const lines = mergedItems.map((item) => {
+        const product = productById.get(item.productId)!;
+        const variant = item.variantId ? product.variants.find((candidate) => candidate.id === item.variantId) : undefined;
+        if (item.variantId && (!variant || variant.status !== "ACTIVE")) {
+          throw httpError(400, "ITEM_UNAVAILABLE", `${product.name} is no longer available`);
+        }
+        return {
+          unitMinor: unitPriceMinor(product, variant),
+          quantity: item.quantity,
+          productName: product.name,
+          categoryName: product.category.name,
+          categorySlug: product.category.slug,
+        };
+      });
+      const discountMinor = couponDiscountMinor(lines, code);
+      if (discountMinor === 0) {
+        throw httpError(400, "COUPON_NOT_APPLICABLE", `${COUPONS[code].label} isn't applicable to the chairs in your cart`);
+      }
+      return {
+        code,
+        label: COUPONS[code].label,
+        percentOff: COUPONS[code].percentOff,
+        discountTotal: fromMinor(discountMinor),
+      };
+    },
+
     // Replaces the whole cart. Every line must be an ACTIVE product (and ACTIVE variant of that product); a line
     // wanting more than the stock is accepted (the cart reports it) and checked again when the order is placed.
     async replaceCart(userId: string, lines: CartLineInput[]) {
@@ -180,7 +232,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
 
     // ---- orders ----------------------------------------------------------------------------------------------
 
-    async createOrder(userId: string, input: { idempotencyKey: string; addressId: string; shippingMethod: ShippingMethod; note?: string }) {
+    async createOrder(userId: string, input: { idempotencyKey: string; addressId: string; shippingMethod: ShippingMethod; note?: string; couponCode?: string }) {
       const customer = await customerFor(userId);
 
       const result = await retryOnConflict(() => prisma.$transaction(
@@ -197,13 +249,23 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
 
           const cart = await tx.cart.findUnique({
             where: { customerId: customer.id },
-            include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true } }, variant: true } } },
+            include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true, category: true } }, variant: true } } },
           });
           if (!cart || cart.items.length === 0) throw httpError(400, "CART_EMPTY", "Your cart is empty");
 
           for (const item of cart.items) {
             const unavailable = item.product.status !== "ACTIVE" || (item.variantId !== null && (!item.variant || item.variant.status !== "ACTIVE" || item.variant.productId !== item.productId));
             if (unavailable) throw httpError(409, "ITEM_UNAVAILABLE", `${item.product.name} is no longer available`);
+          }
+
+          const couponCode = input.couponCode ? normaliseCouponCode(input.couponCode) : undefined;
+          if (input.couponCode && !couponCode) throw httpError(400, "COUPON_INVALID", "This coupon code isn't valid");
+          if (couponCode) {
+            const redeemed = await tx.retailOrder.findFirst({
+              where: { customerId: customer.id, discountCode: couponCode },
+              select: { id: true },
+            });
+            if (redeemed) throw httpError(409, "COUPON_ALREADY_USED", "This coupon has already been used on your account");
           }
 
           // Products are locked (shared) in id order before any stock row, matching the admin product save
@@ -220,8 +282,18 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
             if (reserved === 0) throw httpError(409, "INSUFFICIENT_STOCK", `Not enough stock for ${item.product.name}`);
           }
 
-          const lines = cart.items.map((item) => ({ item, unitMinor: unitPriceMinor(item.product, item.variant) }));
-          const totals = computeTotals(lines.map((line) => ({ unitMinor: line.unitMinor, quantity: line.item.quantity })), input.shippingMethod);
+          const lines = cart.items.map((item) => ({
+            item,
+            unitMinor: unitPriceMinor(item.product, item.variant),
+            productName: item.product.name,
+            categoryName: item.product.category.name,
+            categorySlug: item.product.category.slug,
+          }));
+          const totals = computeTotals(
+            lines.map(({ item, ...line }) => ({ ...line, quantity: item.quantity })),
+            input.shippingMethod,
+            couponCode,
+          );
 
           const order = await tx.retailOrder.create({
             data: {
@@ -229,6 +301,8 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
               status: "PENDING",
               paymentStatus: "UNPAID",
               subtotal: fromMinor(totals.subtotalMinor),
+              discountCode: couponCode ?? null,
+              discountTotal: fromMinor(totals.discountMinor),
               shippingTotal: fromMinor(totals.shippingMinor),
               total: fromMinor(totals.totalMinor),
               shippingMethod: input.shippingMethod,
@@ -253,7 +327,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
           await tx.cartItem.deleteMany({ where: { id: { in: cart.items.map((item) => item.id) } } });
           const presented = presentOrder(order);
           const notification = await enqueueOrderEmail(tx, userId, order.id, "placed", (customerName) =>
-            orderPlacedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, ...emailParts(presented) }),
+            orderPlacedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, discountCode: presented.discountCode, discountTotal: presented.discountTotal, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, ...emailParts(presented) }),
           );
           return { order: presented, replay: false, notification };
         },

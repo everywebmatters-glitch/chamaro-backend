@@ -67,6 +67,17 @@ test("the order-placed email says plainly that payment is pending and nothing sh
   assert.doesNotMatch(html + text, /order is confirmed|order has been confirmed/i, "never calls the order confirmed");
 });
 
+test("the order-placed email shows an applied coupon deduction", () => {
+  const { html, text } = email.orderPlacedEmail({
+    ...order,
+    discountCode: "WELCOME10",
+    discountTotal: "100.00",
+    total: "26900.00",
+  });
+  assert.ok(html.includes("Discount (WELCOME10)") && html.includes("100.00"));
+  assert.ok(text.includes("Discount (WELCOME10): -Rs. 100.00"));
+});
+
 test("no email asks for a reply to the no-reply sender; order and account emails point at the contact page", () => {
   const messages = [
     email.orderPlacedEmail(order),

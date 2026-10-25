@@ -132,6 +132,7 @@ test("cart, addresses and orders require a customer; admin order routes require 
       ["GET", "/api/v1/cart", undefined],
       ["PUT", "/api/v1/cart", { items: [] }],
       ["DELETE", "/api/v1/cart", undefined],
+      ["POST", "/api/v1/coupons/validate", { code: "WELCOME5", items: [{ productId: "x", quantity: 1 }] }],
       ["GET", "/api/v1/addresses", undefined],
       ["POST", "/api/v1/addresses", address],
       ["PUT", "/api/v1/addresses/x", { city: "c" }],
@@ -285,7 +286,7 @@ test("an order is priced from the database, reserves stock, empties the cart and
     assert.equal(placed.statusCode, 201, placed.body);
     const order = placed.json().data;
     assert.deepEqual([order.status, order.paymentStatus], ["PENDING", "UNPAID"]);
-    assert.deepEqual([order.subtotal, order.shippingTotal, order.total], ["2200.00", "499.00", "2699.00"]);
+    assert.deepEqual([order.subtotal, order.discountTotal, order.shippingTotal, order.total], ["2200.00", "0.00", "0.00", "2200.00"]);
     assert.equal(order.note, "Leave at the gate");
     assert.equal(order.items.length, 1);
     assert.deepEqual([order.items[0].quantity, order.items[0].unitPrice, order.items[0].lineTotal, order.items[0].productName], [2, "1100.00", "2200.00", product.name]);
@@ -295,7 +296,7 @@ test("an order is priced from the database, reserves stock, empties the cart and
     assert.deepEqual((await app.inject({ method: "GET", url: "/api/v1/cart", headers: buyer.headers })).json().data.items, [], "the cart is emptied");
     const list = (await app.inject({ method: "GET", url: "/api/v1/orders", headers: buyer.headers })).json();
     assert.deepEqual([list.data.length, list.meta.total, list.data[0].id], [1, 1, order.id]);
-    assert.equal((await app.inject({ method: "GET", url: `/api/v1/orders/${order.id}`, headers: buyer.headers })).json().data.total, "2699.00");
+    assert.equal((await app.inject({ method: "GET", url: `/api/v1/orders/${order.id}`, headers: buyer.headers })).json().data.total, "2200.00");
 
     // Empty cart now.
     const again = await shop.order(buyer.headers, { addressId: buyer.address, shippingMethod: "standard" });
@@ -303,7 +304,7 @@ test("an order is priced from the database, reserves stock, empties the cart and
     assert.equal(again.json().error.code, "CART_EMPTY");
   }));
 
-test("free standard shipping from the threshold, express never free, variant and untracked products work", { skip: skipReason }, () =>
+test("two or more chairs get free standard shipping, express never does, variant and untracked products work", { skip: skipReason }, () =>
   withShop(async (shop) => {
     const untracked = await shop.product({ price: "6000.00" }); // no inventory row: stock not tracked
     const variants = await shop.product({ price: "3000.00", stock: 4, variants: [{ name: "Walnut", price: "2000.00" }] });
@@ -319,6 +320,81 @@ test("free standard shipping from the threshold, express never free, variant and
     await shop.putCart(buyer.headers, [{ productId: untracked.id, quantity: 1 }]);
     const express = (await shop.order(buyer.headers, { addressId: address, shippingMethod: "express" })).json().data;
     assert.deepEqual([express.subtotal, express.shippingTotal, express.total], ["6000.00", "999.00", "6999.00"]);
+  }));
+
+test("coupons validate by account, discount only eligible chair lines, and are redeemed once per customer", { skip: skipReason }, () =>
+  withShop(async (shop) => {
+    const { app } = shop;
+    const boss = await shop.product({ price: "1000.00" });
+    await app.prisma.product.update({ where: { id: boss.id }, data: { name: "Boss Chair" } });
+    const regular = await shop.product({ price: "2000.00" });
+    const buyer = await shop.customer("coupon-buyer");
+    const address = (await shop.address(buyer.headers)).json().data.id as string;
+    const items = [
+      { productId: boss.id, quantity: 2 },
+      { productId: regular.id, quantity: 1 },
+    ];
+    await shop.putCart(buyer.headers, items);
+
+    const bossCoupon = await app.inject({
+      method: "POST",
+      url: "/api/v1/coupons/validate",
+      headers: buyer.headers,
+      payload: { code: "WELCOME10", items },
+    });
+    assert.equal(bossCoupon.statusCode, 200, bossCoupon.body);
+    assert.deepEqual(bossCoupon.json().data, {
+      code: "WELCOME10",
+      label: "10% off Boss chairs",
+      percentOff: 10,
+      discountTotal: "200.00",
+    });
+
+    const chairCoupon = await app.inject({
+      method: "POST",
+      url: "/api/v1/coupons/validate",
+      headers: buyer.headers,
+      payload: { code: "WELCOME5", items },
+    });
+    assert.equal(chairCoupon.statusCode, 200, chairCoupon.body);
+    assert.equal(chairCoupon.json().data.discountTotal, "200.00");
+
+    const placed = await shop.order(buyer.headers, {
+      addressId: address,
+      shippingMethod: "standard",
+      couponCode: "WELCOME10",
+    });
+    assert.equal(placed.statusCode, 201, placed.body);
+    const order = placed.json().data;
+    assert.deepEqual([order.subtotal, order.discountCode, order.discountTotal, order.shippingTotal, order.total], [
+      "4000.00", "WELCOME10", "200.00", "0.00", "3800.00",
+    ]);
+
+    await shop.putCart(buyer.headers, [{ productId: boss.id, quantity: 1 }]);
+    const usedAgain = await app.inject({
+      method: "POST",
+      url: "/api/v1/coupons/validate",
+      headers: buyer.headers,
+      payload: { code: "WELCOME10", items: [{ productId: boss.id, quantity: 1 }] },
+    });
+    assert.equal(usedAgain.statusCode, 409);
+    assert.equal(usedAgain.json().error.code, "COUPON_ALREADY_USED");
+    const repeatedOrder = await shop.order(buyer.headers, {
+      addressId: address,
+      shippingMethod: "standard",
+      couponCode: "WELCOME10",
+    });
+    assert.equal(repeatedOrder.statusCode, 409);
+    assert.equal(repeatedOrder.json().error.code, "COUPON_ALREADY_USED");
+
+    const otherBuyer = await shop.customer("coupon-other");
+    const otherValidation = await app.inject({
+      method: "POST",
+      url: "/api/v1/coupons/validate",
+      headers: otherBuyer.headers,
+      payload: { code: "WELCOME10", items: [{ productId: boss.id, quantity: 1 }] },
+    });
+    assert.equal(otherValidation.statusCode, 200, otherValidation.body);
   }));
 
 test("an order that cannot be fulfilled is rejected whole: nothing is reserved and no order exists", { skip: skipReason }, () =>

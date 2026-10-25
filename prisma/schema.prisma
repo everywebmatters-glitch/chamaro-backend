@@ -375,6 +375,8 @@ model RetailOrder {
   status                  RetailOrderStatus   @default(PENDING)
   paymentStatus           RetailPaymentStatus @default(UNPAID)
   subtotal                Decimal             @db.Decimal(12, 2)
+  discountCode            String?             @db.VarChar(32)
+  discountTotal           Decimal             @default(0) @db.Decimal(12, 2)
   shippingTotal           Decimal             @default(0) @db.Decimal(12, 2)
   total                   Decimal             @db.Decimal(12, 2)
   shippingMethod          String?             @db.VarChar(32)
@@ -397,6 +399,7 @@ model RetailOrder {
   updatedAt               DateTime            @updatedAt
 
   @@unique([customerId, idempotencyKey])
+  @@unique([customerId, discountCode])
   @@index([customerId, createdAt])
   @@index([status, createdAt])
   @@index([shippingAddressId])

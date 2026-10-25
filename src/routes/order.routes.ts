@@ -40,7 +40,35 @@ const createOrderBody = {
   type: "object",
   additionalProperties: false,
   required: ["addressId", "shippingMethod"],
-  properties: { addressId: { type: "string", minLength: 1 }, shippingMethod: { type: "string", enum: SHIPPING_METHODS }, note: { type: "string", maxLength: 500 } },
+  properties: {
+    addressId: { type: "string", minLength: 1 },
+    shippingMethod: { type: "string", enum: SHIPPING_METHODS },
+    note: { type: "string", maxLength: 500 },
+    couponCode: { type: "string", enum: ["WELCOME10", "WELCOME5"] },
+  },
+};
+const couponValidationBody = {
+  type: "object",
+  additionalProperties: false,
+  required: ["code", "items"],
+  properties: {
+    code: { type: "string", enum: ["WELCOME10", "WELCOME5"] },
+    items: {
+      type: "array",
+      minItems: 1,
+      maxItems: 50,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["productId", "quantity"],
+        properties: {
+          productId: { type: "string", minLength: 1 },
+          variantId: { type: "string", minLength: 1 },
+          quantity: { type: "integer", minimum: 1, maximum: MAX_LINE_QUANTITY },
+        },
+      },
+    },
+  },
 };
 const idempotencyHeaders = {
   type: "object",
@@ -77,6 +105,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { success: true, data: await service.replaceCart(userId(request), items) };
   });
 
+  app.post("/api/v1/coupons/validate", { schema: routeSchema(["Coupons"], "Validate a coupon against the signed-in customer's cart", { security: bearer, body: couponValidationBody }) }, async (request) => {
+    await request.requireCustomer();
+    const body = request.body as { code: string; items: { productId: string; variantId?: string; quantity: number }[] };
+    return { success: true, data: await service.validateCoupon(userId(request), { code: body.code, items: body.items }) };
+  });
+
   app.delete("/api/v1/cart", { schema: routeSchema(["Cart"], "Empty the signed-in customer's cart", { security: bearer }) }, async (request, reply) => {
     await request.requireCustomer();
     await service.clearCart(userId(request));
@@ -89,9 +123,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { schema: routeSchema(["Orders"], "Place an order from the server cart (send an Idempotency-Key header; a retry returns the same order)", { security: bearer, headers: idempotencyHeaders, body: createOrderBody }) },
     async (request, reply) => {
       await request.requireCustomer();
-      const body = request.body as { addressId: string; shippingMethod: "standard" | "express"; note?: string };
+      const body = request.body as { addressId: string; shippingMethod: "standard" | "express"; note?: string; couponCode?: string };
       const key = request.headers["idempotency-key"] as string;
-      const { order, replay } = await service.createOrder(userId(request), { idempotencyKey: key, addressId: body.addressId, shippingMethod: body.shippingMethod, note: body.note?.trim() || undefined });
+      const { order, replay } = await service.createOrder(userId(request), { idempotencyKey: key, addressId: body.addressId, shippingMethod: body.shippingMethod, note: body.note?.trim() || undefined, couponCode: body.couponCode });
       reply.code(replay ? 200 : 201);
       return { success: true, data: order };
     },
