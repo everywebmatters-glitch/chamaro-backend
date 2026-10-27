@@ -23,6 +23,7 @@ import { addressRoutes } from "./routes/address.routes.js";
 import { orderRoutes } from "./routes/order.routes.js";
 import { paymentRoutes } from "./routes/payment.routes.js";
 import { shipmentRoutes } from "./routes/shipment.routes.js";
+import { b2bEnquiryRoutes } from "./routes/b2b-enquiry.routes.js";
 
 export async function buildApp() {
   // Fastify's AJV defaults to removeAdditional: true, which silently strips properties that
@@ -60,5 +61,6 @@ export async function buildApp() {
   await app.register(orderRoutes);
   await app.register(paymentRoutes);
   await app.register(shipmentRoutes);
+  await app.register(b2bEnquiryRoutes);
   return app;
 }
