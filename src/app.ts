@@ -20,6 +20,7 @@ import { cmsRoutes } from "./routes/cms.routes.js";
 import { mediaRoutes } from "./routes/media.routes.js";
 import { addressRoutes } from "./routes/address.routes.js";
 import { orderRoutes } from "./routes/order.routes.js";
+import { b2bEnquiryRoutes } from "./routes/b2b-enquiry.routes.js";
 
 export async function buildApp() {
   // Fastify's AJV defaults to removeAdditional: true, which silently strips properties that
@@ -54,5 +55,6 @@ export async function buildApp() {
   await app.register(mediaRoutes);
   await app.register(addressRoutes);
   await app.register(orderRoutes);
+  await app.register(b2bEnquiryRoutes);
   return app;
 }
