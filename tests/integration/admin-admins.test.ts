@@ -19,6 +19,7 @@ test("admin-created admins and admin-to-admin authorization", { skip: skipReason
   let actingAdminId: string | undefined;
   let createdAdminId: string | undefined;
   let customerId: string | undefined;
+  let previousStoreSettings: { storeName: string; supportEmail: string; supportPhone: string; currency: string; timezone: string } | null = null;
   try {
     const actingAdmin = await app.prisma.user.create({ data: { name: "Acting Admin", email: actingAdminEmail, passwordHash, role: "ADMIN", isActive: true } });
     actingAdminId = actingAdmin.id;
@@ -41,6 +42,7 @@ test("admin-created admins and admin-to-admin authorization", { skip: skipReason
     // 7. customer token -> 403
     const customer = await app.prisma.user.create({ data: { name: "Customer", email: `customer-${suffix}@example.test`, passwordHash, role: "CUSTOMER", isActive: true } });
     customerId = customer.id;
+    await app.prisma.customer.create({ data: { userId: customer.id, customerType: "B2B", phone: "+911234567890", companyName: "Example Customer Co." } });
     const customerToken = app.jwt.sign({ sub: customer.id, role: "CUSTOMER" });
     const asCustomer = await app.inject({ method: "POST", url: "/api/v1/admin/admins", headers: { authorization: `Bearer ${customerToken}` }, payload: { name: "New Admin", email: newAdminEmail, password: "new-admin-password-123" } });
     assert.equal(asCustomer.statusCode, 403);
@@ -59,6 +61,43 @@ test("admin-created admins and admin-to-admin authorization", { skip: skipReason
     // The newly created admin can actually log in
     const newAdminLogin = await app.inject({ method: "POST", url: "/api/v1/auth/admin/login", payload: { email: newAdminEmail, password: "new-admin-password-123" } });
     assert.equal(newAdminLogin.statusCode, 200);
+    const newAdminToken = newAdminLogin.json().data.token;
+    const newAdminHeaders = { authorization: adminHeaders.authorization.replace(adminToken, newAdminToken) };
+
+    const adminList = await app.inject({ method: "GET", url: `/api/v1/admin/admins?search=${encodeURIComponent(newAdminEmail)}`, headers: adminHeaders });
+    assert.equal(adminList.statusCode, 200);
+    assert.equal(adminList.json().data.length, 1);
+    assert.equal(adminList.json().data[0].id, createdAdminId);
+    assert.equal("passwordHash" in adminList.json().data[0], false);
+
+    const customerList = await app.inject({ method: "GET", url: `/api/v1/admin/customers?customerType=B2B&search=${encodeURIComponent("Example Customer")}`, headers: adminHeaders });
+    assert.equal(customerList.statusCode, 200);
+    assert.equal(customerList.json().data.length, 1);
+    assert.equal(customerList.json().data[0].customer.companyName, "Example Customer Co.");
+    assert.equal(customerList.json().data[0].customer._count.retailOrders, 0);
+    assert.equal("passwordHash" in customerList.json().data[0], false);
+
+    previousStoreSettings = await app.prisma.storeSettings.findUnique({ where: { id: "store" } });
+    const savedSettings = await app.inject({
+      method: "PUT",
+      url: "/api/v1/admin/store-settings",
+      headers: adminHeaders,
+      payload: { storeName: "Chamaro", supportEmail: "HELP@CHAMARO.COM", supportPhone: "+911234567890", currency: "inr", timezone: "Asia/Kolkata" },
+    });
+    assert.equal(savedSettings.statusCode, 200);
+    assert.equal(savedSettings.json().data.storeName, "Chamaro");
+    assert.equal(savedSettings.json().data.supportEmail, "help@chamaro.com");
+    assert.equal(savedSettings.json().data.currency, "INR");
+    const readSettings = await app.inject({ method: "GET", url: "/api/v1/admin/store-settings", headers: adminHeaders });
+    assert.equal(readSettings.statusCode, 200);
+    assert.equal(readSettings.json().data.timezone, "Asia/Kolkata");
+    const invalidTimezone = await app.inject({
+      method: "PUT",
+      url: "/api/v1/admin/store-settings",
+      headers: adminHeaders,
+      payload: { storeName: "Chamaro", supportEmail: "", supportPhone: "", currency: "INR", timezone: "Not/A_Timezone" },
+    });
+    assert.equal(invalidTimezone.statusCode, 400);
 
     // 9. role field in body -> 400
     const withRole = await app.inject({ method: "POST", url: "/api/v1/admin/admins", headers: adminHeaders, payload: { name: "X", email: `role-${suffix}@example.test`, password: "some-password-123", role: "ADMIN" } });
@@ -74,7 +113,20 @@ test("admin-created admins and admin-to-admin authorization", { skip: skipReason
     const duplicate = await app.inject({ method: "POST", url: "/api/v1/admin/admins", headers: adminHeaders, payload: { name: "Dup", email: newAdminEmail, password: "some-password-123" } });
     assert.equal(duplicate.statusCode, 409);
     assert.equal(duplicate.json().error.code, "DUPLICATE_RECORD");
+
+    const cannotDisableLastAdmin = await app.inject({ method: "PATCH", url: `/api/v1/admin/admins/${actingAdminId}/status`, headers: newAdminHeaders, payload: { isActive: false } });
+    assert.equal(cannotDisableLastAdmin.statusCode, 409);
+    const cannotDisableSelf = await app.inject({ method: "PATCH", url: `/api/v1/admin/admins/${actingAdminId}/status`, headers: adminHeaders, payload: { isActive: false } });
+    assert.equal(cannotDisableSelf.statusCode, 400);
+    const deactivateAdmin = await app.inject({ method: "PATCH", url: `/api/v1/admin/admins/${createdAdminId}/status`, headers: adminHeaders, payload: { isActive: false } });
+    assert.equal(deactivateAdmin.statusCode, 200);
+    assert.equal(deactivateAdmin.json().data.isActive, false);
   } finally {
+    if (previousStoreSettings) {
+      await app.prisma.storeSettings.update({ where: { id: "store" }, data: previousStoreSettings }).catch(() => undefined);
+    } else {
+      await app.prisma.storeSettings.deleteMany({ where: { id: "store" } }).catch(() => undefined);
+    }
     if (createdAdminId) await app.prisma.user.delete({ where: { id: createdAdminId } }).catch(() => undefined);
     if (customerId) await app.prisma.user.delete({ where: { id: customerId } }).catch(() => undefined);
     if (actingAdminId) await app.prisma.user.delete({ where: { id: actingAdminId } }).catch(() => undefined);
