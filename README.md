@@ -13,6 +13,12 @@ Useful checks: `npm run prisma:validate` and `npm run build`.
 
 The API uses `Authorization: Bearer <token>` for administrator routes. Login at `POST /api/v1/auth/admin/login`, copy `data.token`, and use Swagger's **Authorize** control.
 
+### Admin console APIs
+
+- `GET /api/v1/admin/customers` lists customer accounts. Optional query parameters: `page`, `limit`, `search` (name, email, phone, or company), and `customerType` (`RETAIL` or `B2B`).
+- `GET /api/v1/admin/admins` lists administrators with optional `page`, `limit`, and `search`; `POST /api/v1/admin/admins` provisions an account; `PATCH /api/v1/admin/admins/:id/status` activates or deactivates one. Password hashes are never returned, and the active administrator cannot deactivate their own account or the last active administrator.
+- `GET /api/v1/admin/store-settings` reads the saved store name, support email/phone, ISO 4217 currency code, and IANA timezone. It returns blank fields before the first save. `PUT` on the same path saves those settings.
+
 Customers log in at `POST /api/v1/auth/login` and read their profile at `GET /api/v1/auth/me` (active `CUSTOMER` tokens only). Tokens last 8 hours; there is no refresh or server-side logout.
 
 Retail coupons are validated for signed-in customers at `POST /api/v1/coupons/validate`. `WELCOME10` discounts Boss chair lines by 10%; `WELCOME5` discounts chair lines by 5%. The code is recorded on an order and is usable once per customer account. Standard delivery is free when the order contains at least two chairs; express delivery remains paid.

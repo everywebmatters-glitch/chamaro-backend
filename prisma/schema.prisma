@@ -110,6 +110,17 @@ model AdminUser {
   updatedAt   DateTime  @updatedAt
 }
 
+model StoreSettings {
+  id           String   @id @default("store") @db.VarChar(32)
+  storeName    String   @default("") @db.VarChar(191)
+  supportEmail String   @default("") @db.VarChar(191)
+  supportPhone String   @default("") @db.VarChar(32)
+  currency     String   @default("") @db.Char(3)
+  timezone     String   @default("") @db.VarChar(100)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
 enum CustomerType {
   RETAIL
   B2B
