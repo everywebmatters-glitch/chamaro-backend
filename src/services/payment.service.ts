@@ -14,6 +14,7 @@ import {
   type RemotePayment,
 } from "../providers/razorpay.provider.js";
 import { httpError } from "../shared/http.js";
+import { gstInvoiceSummary } from "../shared/gst-invoice.js";
 import { toMinor } from "../shared/order-pricing.js";
 import { createCheckoutService } from "./checkout.service.js";
 import { orderCancelledEmail, orderConfirmedEmail } from "./email.service.js";
@@ -171,8 +172,14 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
           // recorded exactly when the order becomes paid; the worker calls Delhivery after this commits.
           if (payment.mode === "live") await queueCourierBooking(tx, order.id);
           const presented = presentOrder(order);
+          const orderEmailParts = emailParts(presented);
+          const gstSummary = gstInvoiceSummary(
+            { subtotal: presented.subtotal, discountTotal: presented.discountTotal, shippingAddress: orderEmailParts.shippingAddress },
+            process.env.DELHIVERY_SELLER_GST_TIN?.trim() || null,
+          );
+          if (!gstSummary.split) options.log?.warn({ orderId: order.id }, "GST tax split unavailable: seller or destination state is not configured");
           result.notification = await enqueueOrderEmail(tx, order.customer.userId, order.id, "confirmed", (customerName) =>
-            orderConfirmedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, discountTotal: presented.discountTotal, couponCode: presented.couponCode, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, paidAt: now, ...emailParts(presented) }),
+            orderConfirmedEmail({ id: presented.id, createdAt: presented.createdAt, customerName, subtotal: presented.subtotal, discountTotal: presented.discountTotal, couponCode: presented.couponCode, shippingTotal: presented.shippingTotal, total: presented.total, shippingMethod: presented.shippingMethod, paidAt: now, gstSummary, ...orderEmailParts }),
           );
           result.outcome = "paid";
           options.log?.info({ paymentId: payment.id, orderId: order.id }, "Order paid");

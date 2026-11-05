@@ -1,6 +1,7 @@
 // Email templates and delivery, with a fake Resend client: nothing here reaches the network.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { gstInvoiceSummary } from "../../src/shared/gst-invoice.js";
 
 // An empty key (dotenv never overwrites a variable that is already set) proves the module imports without one.
 process.env.RESEND_API_KEY = "";
@@ -72,12 +73,30 @@ test("the order-placed email says plainly that payment is pending and nothing sh
 test("order emails disclose an applied coupon and its discount", () => {
   const discounted = { ...order, subtotal: "1000.00", discountTotal: "100.00", couponCode: "WELCOME10", total: "900.00" };
   const placed = email.orderPlacedEmail(discounted);
-  const confirmed = email.orderConfirmedEmail({ ...discounted, paidAt: new Date("2026-10-18T10:01:00Z") });
+  const confirmed = email.orderConfirmedEmail({
+    ...discounted,
+    paidAt: new Date("2026-10-18T10:01:00Z"),
+    gstSummary: gstInvoiceSummary(discounted, "29ABCDE1234F1Z5"),
+  });
   for (const message of [placed, confirmed]) {
     assert.match(message.html, /Discount \(WELCOME10\)/);
     assert.match(message.html, /100\.00/);
     assert.match(message.text, /Discount \(WELCOME10\): -Rs\. 100\.00/);
   }
+});
+
+test("paid confirmation email includes an intra-state GST summary without changing storefront responses", () => {
+  const summary = gstInvoiceSummary(order, "29ABCDE1234F1Z5");
+  const confirmed = email.orderConfirmedEmail({ ...order, paidAt: new Date("2026-10-18T10:01:00Z"), gstSummary: summary });
+
+  assert.match(confirmed.subject, /confirmed: payment received/);
+  assert.match(confirmed.html, /GST at 18% is included in product prices/);
+  assert.match(confirmed.html, /CGST \(9%, included\)/);
+  assert.match(confirmed.html, /SGST \(9%, included\)/);
+  assert.match(confirmed.html, /Seller GSTIN/);
+  assert.match(confirmed.html, /not an IRP-issued e-invoice/);
+  assert.match(confirmed.text, /Delivery is excluded from the GST calculation/);
+  assert.match(confirmed.text, /GST total: Rs\. 4118\.64/);
 });
 
 test("no email asks for a reply to the no-reply sender; order and account emails point at the contact page", () => {

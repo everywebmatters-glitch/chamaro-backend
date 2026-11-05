@@ -1,6 +1,7 @@
 import { Resend } from "resend";
 import { env } from "../config/env.js";
 import type { OtpPurpose } from "../../generated/prisma/client.js";
+import type { GstInvoiceSummary } from "../shared/gst-invoice.js";
 
 // A rendered email: every message has an HTML part and a plain-text alternative.
 export type EmailMessage = { subject: string; html: string; text: string };
@@ -269,11 +270,28 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
 }
 
 // Sent once the payment has been read back from Razorpay as captured for the full order total.
-export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): EmailMessage {
+export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date; gstSummary: GstInvoiceSummary }): EmailMessage {
   const shippingLabel = order.shippingMethod === "surface" ? "Delivery (Delhivery Surface)" : `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
   const discountLabel = `Discount${order.couponCode ? ` (${escapeHtml(order.couponCode)})` : ""}`;
   const discountRow = Number(order.discountTotal) > 0 ? row(discountLabel, `-${rupees(order.discountTotal)}`) : "";
   const discountText = Number(order.discountTotal) > 0 ? `\n${discountLabel}: -${rupeesText(order.discountTotal)}` : "";
+  const gstRows = order.gstSummary.split?.type === "intra"
+    ? `${row("Taxable value (after discount)", rupees(order.gstSummary.taxableValue))}
+        ${row("CGST (9%, included)", rupees(order.gstSummary.split.centralTax))}
+        ${row("SGST (9%, included)", rupees(order.gstSummary.split.stateTax))}`
+    : order.gstSummary.split?.type === "inter"
+      ? `${row("Taxable value (after discount)", rupees(order.gstSummary.taxableValue))}
+        ${row("IGST (18%, included)", rupees(order.gstSummary.split.integratedTax))}`
+      : `${row("Taxable value (after discount)", rupees(order.gstSummary.taxableValue))}
+        ${row("GST (18%, included)", rupees(order.gstSummary.gstTotal))}
+        ${row("Tax split", "Unavailable: seller or destination state not configured")}`;
+  const gstTextRows = order.gstSummary.split?.type === "intra"
+    ? `Taxable value (after discount): ${rupeesText(order.gstSummary.taxableValue)}\nCGST (9%, included): ${rupeesText(order.gstSummary.split.centralTax)}\nSGST (9%, included): ${rupeesText(order.gstSummary.split.stateTax)}`
+    : order.gstSummary.split?.type === "inter"
+      ? `Taxable value (after discount): ${rupeesText(order.gstSummary.taxableValue)}\nIGST (18%, included): ${rupeesText(order.gstSummary.split.integratedTax)}`
+      : `Taxable value (after discount): ${rupeesText(order.gstSummary.taxableValue)}\nGST (18%, included): ${rupeesText(order.gstSummary.gstTotal)}\nTax split: unavailable because seller or destination state is not configured`;
+  const gstinRow = order.gstSummary.sellerGstin ? row("Seller GSTIN", escapeHtml(order.gstSummary.sellerGstin)) : "";
+  const gstinText = order.gstSummary.sellerGstin ? `\nSeller GSTIN: ${order.gstSummary.sellerGstin}` : "";
   return {
     subject: `Chamaro order ${order.id} confirmed: payment received`,
     html: layout(`<p style="${TEXT}">Hi ${escapeHtml(order.customerName)}, we've received your payment and your order is confirmed.</p>
@@ -283,6 +301,9 @@ export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): Email
         ${discountRow}
         ${row(escapeHtml(shippingLabel), rupees(order.shippingTotal))}
         ${row("Total paid", rupees(order.total), TOTAL_CELL)}`)}
+      <p style="${TEXT}"><strong>GST summary</strong><br>GST at 18% is included in product prices. Delivery is excluded from the GST calculation.</p>
+      ${table(`${gstinRow}${gstRows}${row("GST total", rupees(order.gstSummary.gstTotal), TOTAL_CELL)}`)}
+      <p style="${MUTED}">This email is an order tax summary, not an IRP-issued e-invoice.</p>
       ${addressBlock(order.shippingAddress)}
       <p style="${MUTED}">We'll email you again when your order ships.</p>
       <p style="${LAST}">Questions about your order? Contact us at ${contactHtml()} and quote your order reference.</p>`),
@@ -290,6 +311,7 @@ export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): Email
       `Hi ${order.customerName}, we've received your payment and your order is confirmed.`,
       `Order ${order.id}\nPaid ${formatIstDate(order.paidAt)}`,
       `${itemLines(order.items)}\nSubtotal: ${rupeesText(order.subtotal)}${discountText}\n${shippingLabel}: ${rupeesText(order.shippingTotal)}\nTotal paid: ${rupeesText(order.total)}`,
+      `GST summary\nGST at 18% is included in product prices. Delivery is excluded from the GST calculation.\n${gstTextRows}\nGST total: ${rupeesText(order.gstSummary.gstTotal)}${gstinText}\nThis email is an order tax summary, not an IRP-issued e-invoice.`,
       addressText(order.shippingAddress),
       "We'll email you again when your order ships.",
       `Questions about your order? Contact us at ${contactUrl()} and quote your order reference.`,
