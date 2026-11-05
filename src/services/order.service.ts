@@ -1,19 +1,23 @@
 import type { FastifyBaseLogger } from "fastify";
+import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "../../generated/prisma/client.js";
+import { readDelhiveryConfig } from "../config/delhivery.js";
+import { createDelhiveryClient } from "../providers/delhivery.provider.js";
 import { httpError, pageMeta } from "../shared/http.js";
 import {
-  chairCount,
   computeTotals,
+  chairCount,
   couponCode as normalizeCouponCode,
   COUPONS,
   eligibleCouponMinor,
   fromMinor,
+  legacyShippingMinor,
   mergeCartLines,
   toMinor,
   unitPriceMinor,
   unitsPerProduct,
   type CartLineInput,
-  type ShippingMethod,
+  type LegacyShippingMethod,
 } from "../shared/order-pricing.js";
 import { orderCancelledEmail, orderPlacedEmail, shipmentEmail, type EmailMessage, type OrderEmailAddress } from "./email.service.js";
 import { createEmailOutbox, enqueueNotification, type NotificationKind } from "./email-outbox.service.js";
@@ -139,6 +143,40 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
     return prisma.customer.upsert({ where: { userId }, create: { userId, customerType: "RETAIL" }, update: {}, select: { id: true } });
   }
 
+  function shippingCartDetails(items: { productId: string; variantId: string | null; quantity: number; product: { weightGrams: number | null } }[]) {
+    if (items.length === 0) throw httpError(400, "CART_EMPTY", "Your cart is empty");
+    if (items.some((item) => !item.product.weightGrams)) {
+      throw httpError(409, "SHIPPING_WEIGHT_UNAVAILABLE", "A delivery estimate is unavailable because a product's packed weight is missing. Please contact us.");
+    }
+    const weightGrams = items.reduce((total, item) => total + item.product.weightGrams! * item.quantity, 0);
+    if (!Number.isSafeInteger(weightGrams) || weightGrams > 100_000) {
+      throw httpError(400, "SHIPPING_WEIGHT_INVALID", "The packed weight for this cart is outside the courier's supported range");
+    }
+    const cartFingerprint = createHash("sha256")
+      .update(JSON.stringify(items
+        .map((item) => [item.productId, item.variantId, item.quantity, item.product.weightGrams])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0])) || String(a[1] ?? "").localeCompare(String(b[1] ?? "")))))
+      .digest("hex");
+    return { weightGrams, cartFingerprint };
+  }
+
+  async function quoteShipping(userId: string, pin: string) {
+    const customer = await customerFor(userId);
+    const cart = await prisma.cart.findUnique({
+      where: { customerId: customer.id },
+      include: { items: { include: { product: { select: { weightGrams: true } } } } },
+    });
+    const { weightGrams, cartFingerprint } = shippingCartDetails(cart?.items ?? []);
+    const config = readDelhiveryConfig();
+    const courier = createDelhiveryClient(config);
+    const serviceability = await courier.checkPincode(pin);
+    if (!serviceability.serviceable || !serviceability.prepaid) {
+      throw httpError(422, "DELIVERY_PIN_UNSERVICEABLE", "Delhivery cannot deliver prepaid orders to this PIN code");
+    }
+    const estimate = await courier.quoteShippingCharge({ weightGrams, originPin: config.originPin, destinationPin: pin });
+    return { pin, shippingMinor: toMinor(estimate.totalAmount), cartFingerprint };
+  }
+
   // ---- cart ------------------------------------------------------------------------------------------------
 
   async function readCart(db: Db, customerId: string) {
@@ -176,6 +214,8 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
       const customer = await customerFor(userId);
       return readCart(prisma, customer.id);
     },
+
+    quoteShipping,
 
     async validateCoupon(userId: string, input: { code: string; items: CartLineInput[] }) {
       const code = normalizeCouponCode(input.code);
@@ -250,7 +290,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
 
     // ---- orders ----------------------------------------------------------------------------------------------
 
-    async createOrder(userId: string, input: { idempotencyKey: string; addressId: string; shippingMethod: ShippingMethod; note?: string; couponCode?: string }) {
+    async createOrder(userId: string, input: { idempotencyKey: string; addressId: string; shippingQuote?: { pin: string; shippingMinor: number; cartFingerprint: string }; legacyShippingMethod?: LegacyShippingMethod; note?: string; couponCode?: string }) {
       const customer = await customerFor(userId);
 
       const result = await retryOnConflict(() => prisma.$transaction(
@@ -270,6 +310,31 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
             include: { items: { orderBy: { createdAt: "asc" }, include: { product: { include: { inventory: true, category: { select: { slug: true, name: true } } } }, variant: true } } },
           });
           if (!cart || cart.items.length === 0) throw httpError(400, "CART_EMPTY", "Your cart is empty");
+          let shippingMinor: number;
+          let shippingMethod: string;
+          if (input.shippingQuote) {
+            const currentShippingCart = shippingCartDetails(cart.items);
+            if (
+              address.postalCode !== input.shippingQuote.pin ||
+              currentShippingCart.cartFingerprint !== input.shippingQuote.cartFingerprint
+            ) {
+              throw httpError(409, "SHIPPING_QUOTE_EXPIRED", "Your delivery estimate expired or changed. Refresh the estimate and try again.");
+            }
+            if (!Number.isSafeInteger(input.shippingQuote.shippingMinor) || input.shippingQuote.shippingMinor < 0) {
+              throw httpError(400, "SHIPPING_QUOTE_INVALID", "The delivery estimate is invalid. Refresh the estimate and try again.");
+            }
+            shippingMinor = input.shippingQuote.shippingMinor;
+            shippingMethod = "surface";
+          } else if (input.legacyShippingMethod) {
+            shippingMinor = legacyShippingMinor(input.legacyShippingMethod, chairCount(cart.items.map((item) => ({
+              name: item.product.name,
+              category: item.product.category,
+              quantity: item.quantity,
+            }))));
+            shippingMethod = input.legacyShippingMethod;
+          } else {
+            throw httpError(400, "SHIPPING_QUOTE_REQUIRED", "Refresh the delivery estimate and try again.");
+          }
 
           for (const item of cart.items) {
             const unavailable = item.product.status !== "ACTIVE" || (item.variantId !== null && (!item.variant || item.variant.status !== "ACTIVE" || item.variant.productId !== item.productId));
@@ -305,11 +370,9 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
             })));
             if (discountMinor === 0) throw httpError(400, "COUPON_NOT_APPLICABLE", `${code} does not apply to the items in your cart`);
           }
-          const chairs = chairCount(lines.map(({ item }) => ({ name: item.product.name, category: item.product.category, quantity: item.quantity })));
           const totals = computeTotals(
             lines.map((line) => ({ unitMinor: line.unitMinor, quantity: line.item.quantity })),
-            input.shippingMethod,
-            chairs,
+            shippingMinor,
             discountMinor,
           );
 
@@ -323,7 +386,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
               couponCode: code,
               shippingTotal: fromMinor(totals.shippingMinor),
               total: fromMinor(totals.totalMinor),
-              shippingMethod: input.shippingMethod,
+              shippingMethod,
               shippingAddressId: address.id,
               shippingAddressSnapshot: { name: address.name, phone: address.phone, addressLine1: address.addressLine1, addressLine2: address.addressLine2, city: address.city, state: address.state, postalCode: address.postalCode, country: address.country },
               note: input.note ?? null,

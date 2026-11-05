@@ -74,9 +74,16 @@ file and moves all traffic to the new revision at once.
 
 `WELCOME10` discounts Boss chairs by 10%, and `WELCOME5` discounts chairs by 5%. Each signed-in customer account may
 redeem each code once; the order transaction recalculates the discount from current catalogue prices and records the
-code and amount. Standard delivery is free for orders with at least two chair units; express delivery remains charged.
-Chair eligibility is determined from the product name and category name/slug. Migration `0018_coupons_and_chair_shipping`
-adds the order fields and uniqueness constraint; follow the backup and migration steps above before deploying its API image.
+code and amount. Chair eligibility is determined from the product name and category name/slug.
+
+The current checkout requests one Delhivery Surface estimate for the destination PIN and cart weight, using origin PIN
+`600118` unless `DELHIVERY_ORIGIN_PIN` is set. Before deploying the storefront, enter each active product's actual
+packed `weightGrams` in Store Settings; checkout deliberately refuses to guess missing weights. The API temporarily
+accepts the previous server-priced `standard` and `express` order requests so existing storefront sessions keep working
+during rollout. Keep that compatibility until old storefront sessions have expired.
+
+Migration `0018_coupons_and_chair_shipping` adds the order fields and uniqueness constraint; follow the backup and
+migration steps above before deploying its API image.
 
 ## Email outbox
 

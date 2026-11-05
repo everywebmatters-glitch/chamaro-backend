@@ -2,13 +2,8 @@
 // client-supplied prices, totals and discount amounts are never used. Amounts are handled in paise (integer
 // hundredths of a rupee) so sums never accumulate floating-point error.
 
-export type ShippingMethod = "standard" | "express";
-export const SHIPPING_METHODS: ShippingMethod[] = ["standard", "express"];
-
-export const SHIPPING_RULES: Record<ShippingMethod, { priceMinor: number }> = {
-  standard: { priceMinor: 49_900 },
-  express: { priceMinor: 99_900 },
-};
+export type ShippingMethod = "surface";
+export type LegacyShippingMethod = "standard" | "express";
 
 export const MAX_LINE_QUANTITY = 99;
 export const COUPONS = {
@@ -49,6 +44,11 @@ export function chairCount(lines: { name: string; category: { slug: string; name
   return lines.reduce((count, line) => count + (isChair(line) ? line.quantity : 0), 0);
 }
 
+export function legacyShippingMinor(method: LegacyShippingMethod, chairs: number): number {
+  if (method === "standard" && chairs >= 2) return 0;
+  return method === "standard" ? 49_900 : 99_900;
+}
+
 type Amount = string | number | { toString(): string };
 
 export function toMinor(value: Amount): number {
@@ -67,11 +67,6 @@ export function unitPriceMinor(product: { price: Amount }, variant?: { price: Am
   return toMinor(variant?.price != null ? variant.price : product.price);
 }
 
-export function shippingMinor(method: ShippingMethod, chairs: number): number {
-  const rule = SHIPPING_RULES[method];
-  return method === "standard" && chairs >= 2 ? 0 : rule.priceMinor;
-}
-
 export interface OrderTotals {
   subtotalMinor: number;
   discountMinor: number;
@@ -81,13 +76,11 @@ export interface OrderTotals {
 
 export function computeTotals(
   lines: { unitMinor: number; quantity: number }[],
-  method: ShippingMethod,
-  chairs: number,
+  shippingMinor: number,
   discountMinor = 0,
 ): OrderTotals {
   const subtotalMinor = lines.reduce((sum, line) => sum + line.unitMinor * line.quantity, 0);
-  const shipping = shippingMinor(method, chairs);
-  return { subtotalMinor, discountMinor, shippingMinor: shipping, totalMinor: subtotalMinor - discountMinor + shipping };
+  return { subtotalMinor, discountMinor, shippingMinor, totalMinor: subtotalMinor - discountMinor + shippingMinor };
 }
 
 export interface CartLineInput {

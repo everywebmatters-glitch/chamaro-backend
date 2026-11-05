@@ -7,6 +7,7 @@ import "dotenv/config";
 //   DELHIVERY_API_TOKEN        secret (Secret Manager). Sent only as the Authorization header to Delhivery.
 //   DELHIVERY_API_BASE_URL     https://staging-express.delhivery.com, or https://track.delhivery.com in production only.
 //   DELHIVERY_PICKUP_LOCATION  the warehouse name exactly as registered with Delhivery (case sensitive).
+//   DELHIVERY_ORIGIN_PIN       the warehouse PIN for customer-facing Surface shipping estimates (default 600118).
 //   DELHIVERY_WEBHOOK_SECRET   secret, 32+ characters: the bearer token Delhivery's scan push must send.
 //   DELHIVERY_SELLER_GST_TIN, DELHIVERY_HSN_CODE   sent with every shipment. Required with the production host:
 //                              Delhivery's order-creation reference lists seller_gst_tin and hsn_code as mandatory.
@@ -26,6 +27,7 @@ export type DelhiveryConfig = {
   baseUrl: string;
   token: string;
   pickupLocation: string;
+  originPin: string;
   sellerGstTin: string | null;
   hsnCode: string | null;
   timeoutMs: number;
@@ -91,6 +93,9 @@ export function readDelhiveryConfig(env: NodeJS.ProcessEnv = process.env): Delhi
   const pickupLocation = requiredSetting(env, "DELHIVERY_PICKUP_LOCATION");
   if (pickupLocation.length > 191) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_PICKUP_LOCATION is too long");
 
+  const originPin = setting(env, "DELHIVERY_ORIGIN_PIN") ?? "600118";
+  if (!/^[1-9][0-9]{5}$/.test(originPin)) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_ORIGIN_PIN must be a valid six-digit PIN code");
+
   const sellerGstTin = setting(env, "DELHIVERY_SELLER_GST_TIN");
   if (sellerGstTin && !/^[0-9A-Z]{15}$/.test(sellerGstTin)) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_SELLER_GST_TIN must be a 15-character GSTIN");
   const hsnCode = setting(env, "DELHIVERY_HSN_CODE");
@@ -101,7 +106,7 @@ export function readDelhiveryConfig(env: NodeJS.ProcessEnv = process.env): Delhi
   const timeoutMs = rawTimeout ? Number(rawTimeout) : 15_000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 2_000 || timeoutMs > 60_000) throw unavailable("DELHIVERY_NOT_CONFIGURED", "DELHIVERY_TIMEOUT_MS must be a whole number from 2000 to 60000");
 
-  return { environment, baseUrl, token, pickupLocation, sellerGstTin, hsnCode, timeoutMs };
+  return { environment, baseUrl, token, pickupLocation, originPin, sellerGstTin, hsnCode, timeoutMs };
 }
 
 // The bearer token Delhivery's scan push must present. Separate from readDelhiveryConfig so a webhook can be checked

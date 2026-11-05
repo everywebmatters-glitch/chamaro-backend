@@ -22,7 +22,7 @@ test("config: shipping is off unless DELHIVERY_ENABLED=true", () => {
 
 test("config: a complete staging setup is accepted", () => {
   const config = readDelhiveryConfig(env({ DELHIVERY_API_BASE_URL: `${STAGING}/`, DELHIVERY_SELLER_GST_TIN: "29ABCDE1234F1Z5", DELHIVERY_HSN_CODE: "9401" }));
-  assert.deepEqual(config, { environment: "staging", baseUrl: STAGING, token: TOKEN, pickupLocation: "Chamaro Warehouse", sellerGstTin: "29ABCDE1234F1Z5", hsnCode: "9401", timeoutMs: 15_000 });
+  assert.deepEqual(config, { environment: "staging", baseUrl: STAGING, token: TOKEN, pickupLocation: "Chamaro Warehouse", originPin: "600118", sellerGstTin: "29ABCDE1234F1Z5", hsnCode: "9401", timeoutMs: 15_000 });
 });
 
 test("config: missing or invalid values are refused, naming the variable and never echoing a value", () => {
@@ -35,6 +35,7 @@ test("config: missing or invalid values are refused, naming the variable and nev
     [{ DELHIVERY_API_BASE_URL: "https://evil.example.com" }, /DELHIVERY_API_BASE_URL must be/],
     [{ DELHIVERY_API_BASE_URL: "http://staging-express.delhivery.com" }, /DELHIVERY_API_BASE_URL must be/],
     [{ DELHIVERY_PICKUP_LOCATION: "  " }, /DELHIVERY_PICKUP_LOCATION is not set/],
+    [{ DELHIVERY_ORIGIN_PIN: "123" }, /DELHIVERY_ORIGIN_PIN must be a valid/],
     [{ DELHIVERY_SELLER_GST_TIN: "123" }, /DELHIVERY_SELLER_GST_TIN/],
     [{ DELHIVERY_HSN_CODE: "chairs" }, /DELHIVERY_HSN_CODE/],
     [{ DELHIVERY_TIMEOUT_MS: "100" }, /DELHIVERY_TIMEOUT_MS/],
@@ -81,7 +82,7 @@ function fakeDelhivery(reply: (call: Call) => { status: number; body: unknown } 
   return calls;
 }
 
-const config: DelhiveryConfig = { environment: "staging", baseUrl: STAGING, token: TOKEN, pickupLocation: "Chamaro Warehouse", sellerGstTin: null, hsnCode: null, timeoutMs: 5_000 };
+const config: DelhiveryConfig = { environment: "staging", baseUrl: STAGING, token: TOKEN, pickupLocation: "Chamaro Warehouse", originPin: "600118", sellerGstTin: null, hsnCode: null, timeoutMs: 5_000 };
 const client = createDelhiveryClient(config);
 const request: ShipmentRequest = {
   orderRef: "cmorder0001",
@@ -210,12 +211,16 @@ test("track: parses the documented response, by waybill (max 30) or by order ref
 test("pincode, pickup and cancel calls", async () => {
   const calls = fakeDelhivery((call) => {
     if (call.url.pathname === "/c/api/pin-codes/json/") return { status: 200, body: call.url.searchParams.get("filter_codes") === "560001" ? { delivery_codes: [{ postal_code: { pin: 560001, pre_paid: "Y", cod: "Y", pickup: "Y", is_oda: "N", district: "Bangalore", state_code: "KA" } }] } : { delivery_codes: [] } };
+    if (call.url.pathname === "/api/kinko/v1/invoice/charges/.json") return { status: 200, body: [{ total_amount: 47.2, gross_amount: 40 }] };
     if (call.url.pathname === "/fm/request/new/") return JSON.parse(call.body!).pickup_date === "2026-10-21" ? { status: 201, body: { pickup_id: 4323300, pickup_date: "2026-10-21", pickup_time: "11:00:00", incoming_center_name: "Bengaluru_DC", expected_package_count: 2 } } : { status: 401, body: { pickup_location: "Invalid Pickup Location ClientWarehouse matching query does not exist." } };
     if (call.url.pathname === "/api/p/edit") return { status: 200, body: JSON.parse(call.body!).waybill === "OK1" ? { status: true, waybill: "OK1", remark: "Shipment has been cancelled" } : { status: false, remark: "Not allowed" } };
     return { status: 404, body: {} };
   });
   assert.deepEqual(await client.checkPincode("560001"), { pin: "560001", serviceable: true, prepaid: true, cod: true, pickup: true, oda: false, district: "Bangalore", stateCode: "KA" });
   assert.equal((await client.checkPincode("999999")).serviceable, false);
+  assert.deepEqual(await client.quoteShippingCharge({ weightGrams: 12_000, originPin: "600118", destinationPin: "560001" }), { totalAmount: "47.2" });
+  const quoteCall = calls.find((call) => call.url.pathname === "/api/kinko/v1/invoice/charges/.json")!;
+  assert.deepEqual(Object.fromEntries(quoteCall.url.searchParams), { md: "S", cgm: "12000", o_pin: "600118", d_pin: "560001", ss: "Delivered" });
 
   const pickup = await client.requestPickup({ pickupDate: "2026-10-21", pickupTime: "11:00:00", expectedPackageCount: 2 });
   assert.equal(pickup.pickupId, "4323300");

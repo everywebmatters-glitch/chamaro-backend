@@ -90,6 +90,7 @@ export type TrackedShipment = {
 };
 
 export type Serviceability = { pin: string; serviceable: boolean; prepaid: boolean; cod: boolean; pickup: boolean; oda: boolean | null; district: string | null; stateCode: string | null };
+export type ShippingChargeQuote = { totalAmount: string };
 
 export type PickupConfirmation = { pickupId: string; pickupDate: string | null; pickupTime: string | null; incomingCenter: string | null; expectedPackageCount: number | null };
 
@@ -218,6 +219,18 @@ export function createDelhiveryClient(config: DelhiveryConfig) {
       if (!match) return { pin, serviceable: false, prepaid: false, cod: false, pickup: false, oda: null, district: null, stateCode: null };
       const yes = (value: unknown) => value === "Y";
       return { pin, serviceable: true, prepaid: yes(match.pre_paid), cod: yes(match.cod), pickup: yes(match.pickup), oda: match.is_oda === "Y" ? true : match.is_oda === "N" ? false : null, district: str(match.district, 120), stateCode: str(match.state_code, 8) };
+    },
+
+    async quoteShippingCharge(input: { weightGrams: number; originPin: string; destinationPin: string }): Promise<ShippingChargeQuote> {
+      const { body, status } = await call("GET", "/api/kinko/v1/invoice/charges/.json", {
+        query: { md: "S", cgm: String(input.weightGrams), o_pin: input.originPin, d_pin: input.destinationPin, ss: "Delivered" },
+      });
+      const quote = Array.isArray(body) && isObject(body[0]) ? body[0] : null;
+      const amount = quote?.total_amount;
+      if ((!quote) || (typeof amount !== "number" && typeof amount !== "string") || !Number.isFinite(Number(amount)) || Number(amount) < 0) {
+        throw new DelhiveryError("DELHIVERY_BAD_RESPONSE", status, "not_created");
+      }
+      return { totalAmount: String(amount) };
     },
 
     // Manifests one single-piece prepaid shipment. Delhivery assigns the waybill (none is sent).

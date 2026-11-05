@@ -1,8 +1,10 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { idParams, routeSchema } from "../shared/http.js";
-import { MAX_LINE_QUANTITY, SHIPPING_METHODS } from "../shared/order-pricing.js";
+import { httpError, idParams, routeSchema } from "../shared/http.js";
+import { fromMinor, MAX_LINE_QUANTITY } from "../shared/order-pricing.js";
+import type { LegacyShippingMethod } from "../shared/order-pricing.js";
 import { createOrderService } from "../services/order.service.js";
 import { createPaymentService } from "../services/payment.service.js";
+import { createShippingQuoteToken, verifyShippingQuoteToken } from "../utils/shipping-quote.tokens.js";
 
 const customerQuery = { type: "object", additionalProperties: false, properties: { page: { type: "integer", minimum: 1, default: 1 }, limit: { type: "integer", minimum: 1, maximum: 50, default: 10 } } };
 const adminQuery = {
@@ -40,8 +42,23 @@ const cartBody = {
 const createOrderBody = {
   type: "object",
   additionalProperties: false,
-  required: ["addressId", "shippingMethod"],
-  properties: { addressId: { type: "string", minLength: 1 }, shippingMethod: { type: "string", enum: SHIPPING_METHODS }, note: { type: "string", maxLength: 500 }, couponCode: { type: "string", maxLength: 32 } },
+  properties: {
+    addressId: { type: "string", minLength: 1 },
+    shippingQuoteToken: { type: "string", minLength: 1, maxLength: 2048 },
+    shippingMethod: { type: "string", enum: ["standard", "express"] },
+    note: { type: "string", maxLength: 500 },
+    couponCode: { type: "string", maxLength: 32 },
+  },
+  oneOf: [
+    { required: ["addressId", "shippingQuoteToken"], not: { required: ["shippingMethod"] } },
+    { required: ["addressId", "shippingMethod"], not: { required: ["shippingQuoteToken"] } },
+  ],
+};
+const shippingQuoteBody = {
+  type: "object",
+  additionalProperties: false,
+  required: ["pin"],
+  properties: { pin: { type: "string", pattern: "^[1-9][0-9]{5}$" } },
 };
 const validateCouponBody = {
   type: "object",
@@ -100,15 +117,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 
+  app.post(
+    "/api/v1/shipping/quote",
+    { config: { rateLimit: { max: 20, timeWindow: "1 minute" } }, schema: routeSchema(["Shipping"], "Estimate the single Delhivery Surface delivery charge for the customer's cart and destination PIN", { security: bearer, body: shippingQuoteBody }) },
+    async (request) => {
+      await request.requireCustomer();
+      const { pin } = request.body as { pin: string };
+      const quote = await service.quoteShipping(userId(request), pin);
+      return {
+        success: true,
+        data: {
+          pin: quote.pin,
+          shippingCharge: fromMinor(quote.shippingMinor),
+          currency: "INR",
+          quoteToken: createShippingQuoteToken(app, userId(request), quote),
+        },
+      };
+    },
+  );
+
   // ---- customer orders ---------------------------------------------------------------------------------------
   app.post(
     "/api/v1/orders",
     { schema: routeSchema(["Orders"], "Place an order from the server cart (send an Idempotency-Key header; a retry returns the same order)", { security: bearer, headers: idempotencyHeaders, body: createOrderBody }) },
     async (request, reply) => {
       await request.requireCustomer();
-      const body = request.body as { addressId: string; shippingMethod: "standard" | "express"; note?: string; couponCode?: string };
+      const body = request.body as { addressId: string; shippingQuoteToken?: string; shippingMethod?: LegacyShippingMethod; note?: string; couponCode?: string };
       const key = request.headers["idempotency-key"] as string;
-      const { order, replay } = await service.createOrder(userId(request), { idempotencyKey: key, addressId: body.addressId, shippingMethod: body.shippingMethod, note: body.note?.trim() || undefined, couponCode: body.couponCode });
+      const shipping = body.shippingQuoteToken
+        ? { shippingQuote: verifyShippingQuoteToken(app, body.shippingQuoteToken, userId(request)) }
+        : body.shippingMethod
+          ? { legacyShippingMethod: body.shippingMethod }
+          : (() => { throw httpError(400, "SHIPPING_QUOTE_REQUIRED", "Refresh the delivery estimate and try again."); })();
+      const { order, replay } = await service.createOrder(userId(request), { idempotencyKey: key, addressId: body.addressId, ...shipping, note: body.note?.trim() || undefined, couponCode: body.couponCode });
       reply.code(replay ? 200 : 201);
       return { success: true, data: order };
     },

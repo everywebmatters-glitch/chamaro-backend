@@ -240,7 +240,7 @@ function addressText(address: OrderEmailAddress | null): string | null {
 // Sent when an order is placed. The order is UNPAID at that point, so the email says plainly that payment is
 // pending and that nothing is processed or shipped until it is complete.
 export function orderPlacedEmail(order: OrderEmail): EmailMessage {
-  const shippingLabel = `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
+  const shippingLabel = order.shippingMethod === "surface" ? "Delivery (Delhivery Surface)" : `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
   const discountLabel = `Discount${order.couponCode ? ` (${escapeHtml(order.couponCode)})` : ""}`;
   const discountRow = Number(order.discountTotal) > 0 ? row(discountLabel, `-${rupees(order.discountTotal)}`) : "";
   const discountText = Number(order.discountTotal) > 0 ? `\n${discountLabel}: -${rupeesText(order.discountTotal)}` : "";
@@ -270,7 +270,7 @@ export function orderPlacedEmail(order: OrderEmail): EmailMessage {
 
 // Sent once the payment has been read back from Razorpay as captured for the full order total.
 export function orderConfirmedEmail(order: OrderEmail & { paidAt: Date }): EmailMessage {
-  const shippingLabel = `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
+  const shippingLabel = order.shippingMethod === "surface" ? "Delivery (Delhivery Surface)" : `Shipping${order.shippingMethod ? ` (${order.shippingMethod})` : ""}`;
   const discountLabel = `Discount${order.couponCode ? ` (${escapeHtml(order.couponCode)})` : ""}`;
   const discountRow = Number(order.discountTotal) > 0 ? row(discountLabel, `-${rupees(order.discountTotal)}`) : "";
   const discountText = Number(order.discountTotal) > 0 ? `\n${discountLabel}: -${rupeesText(order.discountTotal)}` : "";
