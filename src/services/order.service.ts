@@ -4,6 +4,7 @@ import { Prisma, type PrismaClient } from "../../generated/prisma/client.js";
 import { readDelhiveryConfig } from "../config/delhivery.js";
 import { createDelhiveryClient } from "../providers/delhivery.provider.js";
 import { httpError, pageMeta } from "../shared/http.js";
+import { shippingChargeableWeightGrams } from "../shared/shipping-chargeable-weight.js";
 import {
   computeTotals,
   chairCount,
@@ -143,18 +144,31 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
     return prisma.customer.upsert({ where: { userId }, create: { userId, customerType: "RETAIL" }, update: {}, select: { id: true } });
   }
 
-  function shippingCartDetails(items: { productId: string; variantId: string | null; quantity: number; product: { weightGrams: number | null } }[]) {
+  function shippingCartDetails(items: {
+    productId: string;
+    variantId: string | null;
+    quantity: number;
+    product: { weightGrams: number | null; lengthCm: number | null; widthCm: number | null; heightCm: number | null };
+  }[]) {
     if (items.length === 0) throw httpError(400, "CART_EMPTY", "Your cart is empty");
-    if (items.some((item) => !item.product.weightGrams)) {
-      throw httpError(409, "SHIPPING_WEIGHT_UNAVAILABLE", "A delivery estimate is unavailable because a product's packed weight is missing. Please contact us.");
+    const weightGrams = shippingChargeableWeightGrams(items);
+    if (weightGrams === null) {
+      throw httpError(409, "SHIPPING_WEIGHT_UNAVAILABLE", "A delivery estimate is unavailable because a product's packed weight or dimensions are missing. Please contact us.");
     }
-    const weightGrams = items.reduce((total, item) => total + item.product.weightGrams! * item.quantity, 0);
     if (!Number.isSafeInteger(weightGrams) || weightGrams > 100_000) {
-      throw httpError(400, "SHIPPING_WEIGHT_INVALID", "The packed weight for this cart is outside the courier's supported range");
+      throw httpError(400, "SHIPPING_WEIGHT_INVALID", "The chargeable weight for this cart is outside the courier's supported range");
     }
     const cartFingerprint = createHash("sha256")
       .update(JSON.stringify(items
-        .map((item) => [item.productId, item.variantId, item.quantity, item.product.weightGrams])
+        .map((item) => [
+          item.productId,
+          item.variantId,
+          item.quantity,
+          item.product.weightGrams,
+          item.product.lengthCm,
+          item.product.widthCm,
+          item.product.heightCm,
+        ])
         .sort((a, b) => String(a[0]).localeCompare(String(b[0])) || String(a[1] ?? "").localeCompare(String(b[1] ?? "")))))
       .digest("hex");
     return { weightGrams, cartFingerprint };
@@ -164,7 +178,7 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
     const customer = await customerFor(userId);
     const cart = await prisma.cart.findUnique({
       where: { customerId: customer.id },
-      include: { items: { include: { product: { select: { weightGrams: true } } } } },
+      include: { items: { include: { product: { select: { weightGrams: true, lengthCm: true, widthCm: true, heightCm: true } } } } },
     });
     const { weightGrams, cartFingerprint } = shippingCartDetails(cart?.items ?? []);
     const config = readDelhiveryConfig();
