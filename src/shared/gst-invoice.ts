@@ -56,6 +56,7 @@ export function gstInvoiceSummary(
     shippingAddress: { country?: string; state?: string } | null;
   },
   sellerGstin: string | null,
+  sellerStateCode: string | null = null,
 ): GstInvoiceSummary {
   const productGrossMinor = toMinor(input.subtotal) - toMinor(input.discountTotal);
   if (productGrossMinor < 0) throw new Error("Order discount exceeds product subtotal");
@@ -63,7 +64,10 @@ export function gstInvoiceSummary(
   const taxableMinor = Math.round((productGrossMinor * 100) / 118);
   const gstMinor = productGrossMinor - taxableMinor;
   const cleanedGstin = sellerGstin && /^[0-9A-Z]{15}$/.test(sellerGstin) ? sellerGstin : null;
-  const sellerState = cleanedGstin?.slice(0, 2);
+  const knownStateCodes = new Set(Object.values(STATE_CODES));
+  const gstinStateCode = cleanedGstin?.slice(0, 2);
+  const configuredStateCode = sellerStateCode && knownStateCodes.has(sellerStateCode) ? sellerStateCode : null;
+  const sellerState = gstinStateCode && knownStateCodes.has(gstinStateCode) ? gstinStateCode : configuredStateCode;
   const address = input.shippingAddress;
   const destinationState = address?.country && address.country.trim().toUpperCase() !== "IN"
     ? undefined

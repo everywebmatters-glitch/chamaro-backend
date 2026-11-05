@@ -176,6 +176,7 @@ export function createPaymentService(prisma: PrismaClient, options: { log?: Fast
           const gstSummary = gstInvoiceSummary(
             { subtotal: presented.subtotal, discountTotal: presented.discountTotal, shippingAddress: orderEmailParts.shippingAddress },
             process.env.DELHIVERY_SELLER_GST_TIN?.trim() || null,
+            process.env.GST_SELLER_STATE_CODE?.trim() || null,
           );
           if (!gstSummary.split) options.log?.warn({ orderId: order.id }, "GST tax split unavailable: seller or destination state is not configured");
           result.notification = await enqueueOrderEmail(tx, order.customer.userId, order.id, "confirmed", (customerName) =>

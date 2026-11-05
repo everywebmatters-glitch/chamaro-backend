@@ -83,6 +83,9 @@ spec:
                   value: "false"
                 - name: DELHIVERY_AUTO_BOOKING
                   value: "false"
+                # Fallback for GST tax splitting when this worker has no seller GSTIN setting.
+                - name: GST_SELLER_STATE_CODE
+                  value: "33"
               resources:
                 limits:
                   cpu: 1000m

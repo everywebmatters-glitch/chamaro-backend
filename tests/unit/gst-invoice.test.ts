@@ -51,3 +51,14 @@ test("unrecognized place of supply still reports included GST but does not guess
   assert.equal(summary.gstTotal, "18.00");
   assert.equal(summary.split, null);
 });
+
+test("configured seller state code supports payment workers without the seller GSTIN", () => {
+  const summary = gstInvoiceSummary({
+    subtotal: "118.00",
+    discountTotal: "0.00",
+    shippingAddress: { country: "IN", state: "Tamil Nadu" },
+  }, null, "33");
+
+  assert.equal(summary.sellerGstin, null);
+  assert.deepEqual(summary.split, { type: "intra", centralTax: "9.00", stateTax: "9.00" });
+});
