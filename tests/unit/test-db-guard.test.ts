@@ -44,6 +44,7 @@ const NO_DATABASE_ACCESS = new Map([
   ["security/login-timing.test.ts", "stubbed Prisma client"],
   ["security/product-rules.test.ts", "stubbed Prisma client"],
   ["security/production-config.test.ts", "child processes that only call /health and /docs (no queries)"],
+  ["security/client-ip.test.ts", "only a test probe route and requests refused by validation or rate limiting (no queries)"],
 ]);
 
 function testFiles(dir: string): string[] {

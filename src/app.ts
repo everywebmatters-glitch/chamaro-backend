@@ -25,18 +25,24 @@ import { paymentRoutes } from "./routes/payment.routes.js";
 import { shipmentRoutes } from "./routes/shipment.routes.js";
 import { b2bEnquiryRoutes } from "./routes/b2b-enquiry.routes.js";
 
+// Proxies whose X-Forwarded-For entries are trusted, walking the header from the right (nearest hop first).
+// request.ip is the first address that is NOT one of these, so entries a client writes itself (further left) are never used.
+//  - loopback, linklocal, uniquelocal: the platform hop that connects to the container (Cloud Run's front end, or a
+//    reverse proxy on a private network).
+//  - 8.233.190.129: the production external Application Load Balancer (static IP `chamaro-lb-ip`). Google's load balancer
+//    appends "<client-ip>,<load-balancer-ip>" to X-Forwarded-For, so without this entry every visitor resolved to the
+//    load balancer and shared one rate-limit bucket (2026-11-13 security audit, H1). Only this exact address is trusted,
+//    not Google's ranges: a request sent straight to the run.app URL gets the real client appended by Cloud Run instead.
+// `true` or a numeric hop count is never used: either would let a client pick its own address.
+export const TRUSTED_PROXIES = ["loopback", "linklocal", "uniquelocal", "8.233.190.129/32"];
+
 export async function buildApp() {
   // Fastify's AJV defaults to removeAdditional: true, which silently strips properties that
   // fail `additionalProperties: false` instead of rejecting the request. That would let a
   // client-supplied "role" field pass through silently on register/admin-creation instead of
   // failing validation (role must always come from the server, never the client), so it's
   // disabled here.
-  // Behind Hostinger's reverse proxy every request arrives from the proxy, so the login rate limit
-  // would treat all visitors as one IP. Trust X-Forwarded-For only from proxies on loopback or
-  // private networks: request.ip becomes the first public address the proxy saw, and values a
-  // client adds to X-Forwarded-For itself can't spoof it (unlike `true`; numeric hop counts are
-  // treated as "trust nothing" by this Fastify version).
-  const app = Fastify({ logger: loggerOptions, trustProxy: "loopback,linklocal,uniquelocal", ajv: { customOptions: { removeAdditional: false } } });
+  const app = Fastify({ logger: loggerOptions, trustProxy: TRUSTED_PROXIES, ajv: { customOptions: { removeAdditional: false } } });
   registerErrorHandler(app);
   await app.register(securityHeaders);
   await registerCors(app);
