@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "../../generated/prisma/client.js";
 import { readDelhiveryConfig } from "../config/delhivery.js";
 import { createDelhiveryClient } from "../providers/delhivery.provider.js";
+import { releaseProductStock, reserveProductStock } from "./inventory.service.js";
 import { httpError, pageMeta } from "../shared/http.js";
 import { shippingChargeableWeightGrams } from "../shared/shipping-chargeable-weight.js";
 import {
@@ -83,7 +84,8 @@ const SHIPPABLE_STATUSES = new Set(["PENDING", "CONFIRMED", "PROCESSING"]);
 
 // Customers get customerShipment(); admins get the whole shipment row (it holds no credential).
 export function presentOrder<T extends OrderRow>(order: T, audience: "customer" | "admin" = "customer") {
-  const { shippingAddressSnapshot, shipment, ...rest } = order;
+  // stockState is internal inventory bookkeeping (not part of the order API).
+  const { shippingAddressSnapshot, shipment, stockState: _stockState, ...rest } = order;
   const money = (value: { toString(): string }) => fromMinor(toMinor(value));
   return {
     ...rest,
@@ -125,16 +127,10 @@ export async function enqueueOrderEmail(tx: Prisma.TransactionClient, userId: st
 }
 
 // Gives an order's reserved stock back. Call it inside the transaction that moves the order to a state that will
-// never ship (cancelled, expired unpaid, refunded before shipping), with the order row locked.
+// never ship (cancelled, expired unpaid, refunded before shipping), with the order row locked. The stock write itself
+// lives in the inventory service (the only writer of stock rows).
 export async function releaseReservation(tx: Prisma.TransactionClient, items: { productId: string; quantity: number }[]) {
-  const released = unitsPerProduct(items);
-  const productIds = [...released.keys()].sort();
-  if (productIds.length === 0) return;
-  await tx.$queryRaw`SELECT id FROM Product WHERE id IN (${Prisma.join(productIds)}) ORDER BY id FOR SHARE`;
-  for (const productId of productIds) {
-    const quantity = released.get(productId)!;
-    await tx.$executeRaw`UPDATE Inventory SET reservedQuantity = GREATEST(reservedQuantity - ${quantity}, 0), updatedAt = NOW(3) WHERE productId = ${productId}`;
-  }
+  await releaseProductStock(tx, items);
 }
 
 export function createOrderService(prisma: PrismaClient, options: { log?: FastifyBaseLogger } = {}) {
@@ -355,19 +351,9 @@ export function createOrderService(prisma: PrismaClient, options: { log?: Fastif
             if (unavailable) throw httpError(409, "ITEM_UNAVAILABLE", `${item.product.name} is no longer available`);
           }
 
-          // Products are locked (shared) in id order before any stock row, matching the admin product save
-          // (product first, then variants/inventory), so the two cannot deadlock.
-          const wanted = unitsPerProduct(cart.items);
-          const productIds = [...wanted.keys()].sort();
-          await tx.$queryRaw`SELECT id FROM Product WHERE id IN (${Prisma.join(productIds)}) ORDER BY id FOR SHARE`;
-
-          for (const productId of productIds) {
-            const item = cart.items.find((candidate) => candidate.productId === productId)!;
-            if (!item.product.inventory) continue; // stock isn't tracked for this product
-            const quantity = wanted.get(productId)!;
-            const reserved = await tx.$executeRaw`UPDATE Inventory SET reservedQuantity = reservedQuantity + ${quantity}, updatedAt = NOW(3) WHERE productId = ${productId} AND quantity - reservedQuantity >= ${quantity}`;
-            if (reserved === 0) throw httpError(409, "INSUFFICIENT_STOCK", `Not enough stock for ${item.product.name}`);
-          }
+          // Stock is reserved by the inventory service (the only writer of stock rows): products locked in id order,
+          // then one conditional UPDATE per product; 409 INSUFFICIENT_STOCK when there aren't enough units.
+          await reserveProductStock(tx, cart.items.map((item) => ({ productId: item.productId, quantity: item.quantity, productName: item.product.name, tracked: item.product.inventory !== null })));
 
           const lines = cart.items.map((item) => ({ item, unitMinor: unitPriceMinor(item.product, item.variant) }));
           const code = normalizeCouponCode(input.couponCode);

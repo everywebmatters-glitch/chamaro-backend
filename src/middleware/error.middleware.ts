@@ -16,8 +16,27 @@ type RawError = {
 export type ErrorResponse = { statusCode: number; code: string; message: string };
 export type ErrorLogLevel = "error" | "warn" | "info";
 
+// The database connection pool could not hand out a connection in time, so the request did no database work. Only
+// these exact, observed shapes count (Prisma 7 + the MariaDB driver adapter); anything else stays a 500:
+//  - P2024: the engine's own "timed out fetching a new connection from the connection pool";
+//  - P2028 "Unable to start a transaction in the given time" (an interactive transaction's maxWait ran out before it
+//    began; NOT the other P2028 cases, such as a transaction that expired part-way);
+//  - P2010 whose driver error is the MariaDB connector's pool timeout (originalCode 45028, "pool timeout: failed to
+//    retrieve a connection from pool").
+// The client may retry. Order placement stays safe to retry because of its Idempotency-Key; nothing here retries.
+export function isPoolAcquisitionFailure(error: RawError): boolean {
+  if (error.code === "P2024") return true;
+  if (error.code === "P2028") return /Unable to start a transaction in the given time/.test(error.message);
+  if (error.code === "P2010") {
+    const cause = (error.meta as { driverAdapterError?: { cause?: { originalCode?: unknown; code?: unknown } } } | undefined)?.driverAdapterError?.cause;
+    return String(cause?.originalCode) === "45028" || cause?.code === 45028;
+  }
+  return false;
+}
+
 // The status, code and message the client gets. Unchanged by how the error is logged.
 export function errorResponse(error: RawError): ErrorResponse {
+  if (isPoolAcquisitionFailure(error)) return { statusCode: 503, code: "TRY_AGAIN", message: "The service is busy right now; please try again in a moment" };
   // A 502/503 the code raised on purpose with a fixed, safe message (`expose: true`, e.g. a courier that is down or
   // not configured) keeps its status and message; any other 5xx is reported generically.
   const deliberateUpstream = error.expose === true && (error.statusCode === 502 || error.statusCode === 503);
@@ -106,6 +125,7 @@ export function registerErrorHandler(app: FastifyInstance): void {
     // Repeats name, code and (for errors) the message in the line itself, for viewers that show only the message.
     const summary = level === "error" && fields.errorMessage ? `: ${fields.errorMessage}` : "";
     request.log[level](fields, `${level === "error" ? "Request failed" : "Request refused"}: ${response.statusCode} ${response.code} (${fields.errorName})${summary}`);
+    if (response.code === "TRY_AGAIN") reply.header("Retry-After", "2");
     reply.status(response.statusCode).send({ success: false, error: { code: response.code, message: response.message } });
   });
 }

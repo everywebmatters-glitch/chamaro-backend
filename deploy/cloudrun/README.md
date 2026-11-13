@@ -283,6 +283,21 @@ Orders. Settings (names only; values live in Secret Manager or the manifests): `
 `DELHIVERY_AUTO_BOOKING`, `DELHIVERY_API_BASE_URL`, `DELHIVERY_API_TOKEN`, `DELHIVERY_PICKUP_LOCATION`,
 `DELHIVERY_SELLER_GST_TIN`, `DELHIVERY_HSN_CODE`, `DELHIVERY_WEBHOOK_SECRET`, `DELHIVERY_SCAN_PUSH_ENABLED`.
 
+## Inventory ledger (expand stage: dormant)
+
+Migration `0020_inventory_ledger_expand` only adds columns and tables; checkout, cancellation, expiry, refunds and the
+admin product form behave exactly as before. Every stock write goes through `src/services/inventory.service.ts`.
+
+The backfill, reconciliation and rollback scripts are for the approved cutover only (each production run needs its own
+approval). They print a JSON summary, write `<path>.json` and `<path>.md` with `--report=<path>`, can be limited with
+`--only=<productId>[,...]`, and contain no customer data.
+
+| Script | Default | Purpose |
+|---|---|---|
+| `node dist/src/scripts/inventory-reconcile.js` | read-only | Invariants per stock row; lists products without a stock row. Exit 1 on any violation. |
+| `node dist/src/scripts/inventory-backfill.js [--apply]` | dry run | Converts each product to on-hand / reserved (available stock unchanged), classifies orders, opens the ledger. Products that don't reconcile are skipped and reported, never repaired. Re-running converges orders the previous code placed, shipped or cancelled since. |
+| `node dist/src/scripts/inventory-rollback.js [--apply]` | dry run | Returns migrated products to the legacy numbers exactly, then clears the ledger and order stock states (the JSON report keeps the ledger). Refused while variant-level stock exists. |
+
 ## Notes
 
 - Swagger (`/docs`) is off in production. `/health` does not touch the database.

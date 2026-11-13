@@ -190,6 +190,10 @@ model Product {
   compareAtPrice    Decimal?           @db.Decimal(12, 2)
   sku               String?            @unique @db.VarChar(191)
   status            RecordStatus       @default(DRAFT)
+  // Inventory accounting (expand stage: stored, not yet read by checkout). TRACKED products are sold only against a
+  // stock row; UNLIMITED is set only by the authorised policy action. stockLevel says which row holds the stock.
+  inventoryPolicy   InventoryPolicy    @default(TRACKED)
+  stockLevel        StockLevel         @default(PRODUCT)
   categoryId        String
   category          Category           @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   images            ProductImage[]
@@ -259,12 +263,16 @@ model ProductVariant {
   product          Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
   cartItems        CartItem[]
   retailOrderItems RetailOrderItem[]
+  inventory        VariantInventory?
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
 
   @@index([productId, status])
 }
 
+// Product-level stock. Field names are kept in the expand stage so API responses do not change; after the backfill
+// `quantity` is the physical on-hand count and `reservedQuantity` the units held for orders not yet dispatched.
+// Every write goes through src/services/inventory.service.ts.
 model Inventory {
   id               String   @id @default(cuid())
   productId        String   @unique
@@ -273,6 +281,104 @@ model Inventory {
   product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+}
+
+enum InventoryPolicy {
+  TRACKED
+  UNLIMITED
+}
+
+enum StockLevel {
+  PRODUCT
+  VARIANT
+}
+
+// Where an order's stock is in its life: reserved when placed, then either committed (it left the warehouse) or
+// released (cancelled, expired, refunded before dispatch). NONE: the order holds no tracked stock.
+enum OrderStockState {
+  NONE
+  RESERVED
+  COMMITTED
+  RELEASED
+}
+
+enum StockMovementKind {
+  RESERVE
+  RELEASE
+  COMMIT
+  ADJUST
+  COUNT
+  RESTOCK
+  RETURN_REJECTED
+  MIGRATION
+  UNTRACKED_SALE
+  POLICY_CHANGE
+}
+
+// Per-variant stock for products with stockLevel VARIANT (unused until the D4 mapping is approved).
+model VariantInventory {
+  id        String         @id @default(cuid())
+  variantId String         @unique
+  productId String
+  onHand    Int            @default(0)
+  reserved  Int            @default(0)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@index([productId])
+}
+
+// Append-only stock ledger. No foreign keys on purpose: history must outlive deleted products, variants and orders.
+// stockKey is "P:<productId>" or "V:<variantId>": the row the movement changed. For a stock key, the sum of
+// onHandDelta / reservedDelta since the backfill equals the stock row. One movement per order, key and kind.
+model StockMovement {
+  id            String            @id @default(cuid())
+  kind          StockMovementKind
+  stockKey      String            @db.VarChar(80)
+  productId     String
+  variantId     String?
+  orderId       String?
+  quantity      Int
+  onHandDelta   Int               @default(0)
+  reservedDelta Int               @default(0)
+  actorUserId   String?
+  reason        String?           @db.VarChar(191)
+  createdAt     DateTime          @default(now())
+
+  @@unique([orderId, stockKey, kind])
+  @@index([stockKey, createdAt])
+  @@index([orderId])
+  @@index([productId])
+}
+
+// One inspection of returned units of an order line (decision D3): sellable units go back on hand, rejected ones
+// are recorded but never become stock.
+model ReturnInspection {
+  id          String   @id @default(cuid())
+  orderId     String
+  orderItemId String
+  sellable    Int
+  rejected    Int
+  reason      String   @db.VarChar(191)
+  inspectedBy String
+  createdAt   DateTime @default(now())
+
+  @@index([orderId])
+  @@index([orderItemId])
+}
+
+// Backfill snapshot per product (src/services/inventory-migration.ts): the pre-migration numbers and the units of
+// orders already dispatched, so the conversion runs once and can be reversed exactly.
+model InventoryMigration {
+  id             String   @id @default(cuid())
+  productId      String   @unique
+  oldQuantity    Int
+  oldReserved    Int
+  committedUnits Int
+  newOnHand      Int
+  newReserved    Int
+  migratedAt     DateTime @default(now())
 }
 
 model CmsPage {
@@ -441,6 +547,8 @@ model RetailOrder {
   carrier                 String?             @db.VarChar(64)
   trackingNumber          String?             @db.VarChar(128)
   shippedAt               DateTime?
+  // NULL until the inventory backfill classifies the order (made NOT NULL in the contract stage).
+  stockState              OrderStockState?
   shippingAddressId       String?
   // Order history must survive: customers/addresses referenced by an order cannot be deleted.
   customer                Customer            @relation(fields: [customerId], references: [id], onDelete: Restrict)
@@ -457,6 +565,7 @@ model RetailOrder {
   @@index([customerId, createdAt])
   @@index([status, createdAt])
   @@index([shippingAddressId])
+  @@index([stockState])
 }
 
 // One row per gateway order (a Razorpay "order_..."): an attempt to pay one RetailOrder. Its state is only ever
