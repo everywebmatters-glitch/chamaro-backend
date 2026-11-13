@@ -3,7 +3,7 @@
 #   gcloud builds submit --config deploy/cloudrun/cloudbuild.yaml --substitutions _TAG=$TAG .
 # Images are pushed only if every step passes. Nothing here touches Cloud Run or the database.
 substitutions:
-  _REPO: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images
+  _REPO: asia-south1-docker.pkg.dev/project-d95e700a-8cd9-4c1a-bd5/chamaro-images
   _TAG: ""
 
 steps:
@@ -81,3 +81,8 @@ steps:
 images:
   - ${_REPO}/chamaro-api:${_TAG}
   - ${_REPO}/chamaro-migrate:${_TAG}
+
+# The build runs as a service account (not the legacy Cloud Build account), which requires an explicit log destination.
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s

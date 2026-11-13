@@ -1,17 +1,15 @@
+# Cloud Build upload exclusions. The Dockerfile needs only package*.json, prisma/, prisma.config.ts, tsconfig.json and src/.
 .git
 .gitignore
+.claude/
 node_modules/
-.env
-.env.*
 dist/
 generated/
+.env
+.env.*
 client_secret_*.json
+*.pem
+*.key
 certs/
-tests/integration/
-cd
-cls
-findstr
-gcloud
-npm
-powershell
-type
+tests/
+*.log

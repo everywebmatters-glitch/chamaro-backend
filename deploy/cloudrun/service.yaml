@@ -1,4 +1,7 @@
-# Cloud Run service for the Chamaro API -- a record of the live configuration (exported 2026-10-18) plus APP_BASE_URL.
+# Cloud Run service for the Chamaro API in project project-d95e700a-8cd9-4c1a-bd5 (region asia-south1). This is the
+# PROPOSED configuration for the new project; nothing has been deployed from it yet. Minimum instances 0, maximum 3.
+# The runtime database account is chamaro_app (SELECT/INSERT/UPDATE/DELETE only); schema changes use the separate
+# DATABASE_URL_MIGRATE secret in migrate-job.yaml.
 # Release with `gcloud run deploy --image ...` as in README.md, which keeps every live setting and the traffic split.
 # Do NOT `gcloud run services replace` this file without first diffing it against
 # `gcloud run services describe chamaro-api --region asia-south1 --format export`: replace drops anything missing here
@@ -17,16 +20,16 @@ spec:
     metadata:
       annotations:
         autoscaling.knative.dev/minScale: "0"
-        autoscaling.knative.dev/maxScale: "20"
-        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+        autoscaling.knative.dev/maxScale: "3"
+        run.googleapis.com/cloudsql-instances: project-d95e700a-8cd9-4c1a-bd5:asia-south1:chamaro-mysql-prod
         run.googleapis.com/cpu-throttling: "true"
         run.googleapis.com/startup-cpu-boost: "true"
     spec:
-      serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+      serviceAccountName: chamaro-backend@project-d95e700a-8cd9-4c1a-bd5.iam.gserviceaccount.com
       containerConcurrency: 80
       timeoutSeconds: 300
       containers:
-        - image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-api:<TAG>
+        - image: asia-south1-docker.pkg.dev/project-d95e700a-8cd9-4c1a-bd5/chamaro-images/chamaro-api:<TAG>
           command: ["node"]
           args: ["dist/src/server.js"]
           ports:
@@ -82,7 +85,7 @@ spec:
             - name: RESEND_FROM_EMAIL
               valueFrom:
                 secretKeyRef:
-                  name: RESEND_FROM_EMAIL_DOMAIN
+                  name: RESEND_FROM_EMAIL
                   key: "1"
             # Admin and storefront origins (https://admin.chamaro.com, https://chamaro.com, ...).
             - name: CORS_ORIGIN
@@ -90,6 +93,57 @@ spec:
                 secretKeyRef:
                   name: CORS_ORIGIN
                   key: latest
+            # Razorpay (src/config/razorpay.ts). All three are required for online payment; with any missing the API
+            # answers 503 PAYMENTS_NOT_CONFIGURED and takes no money. The webhook secret is the webhook's own secret,
+            # not the API key secret. Versions are pinned like the worker manifests; create each secret as version 1.
+            - name: RAZORPAY_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: RAZORPAY_KEY_ID
+                  key: "1"
+            - name: RAZORPAY_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: RAZORPAY_KEY_SECRET
+                  key: "1"
+            - name: RAZORPAY_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: RAZORPAY_WEBHOOK_SECRET
+                  key: "1"
+            # Live (rzp_live_) keys are refused unless this is exactly "true". Kept "false" here until live payments are
+            # deliberately approved; change it together with payment-worker-job.yaml, which must carry the same value.
+            - name: RAZORPAY_ALLOW_LIVE_KEYS
+              value: "false"
+            # Delhivery (src/config/delhivery.ts). Shipping is off unless DELHIVERY_ENABLED is exactly "true", and
+            # automatic booking additionally needs DELHIVERY_AUTO_BOOKING. Keep both "false" until live dispatch is
+            # approved; they must equal the values in payment-worker-job.yaml and shipment-tracking-job.yaml.
+            - name: DELHIVERY_ENABLED
+              value: "false"
+            - name: DELHIVERY_AUTO_BOOKING
+              value: "false"
+            # Required by the app whenever shipping is enabled; Delhivery production is the only host accepted with
+            # APP_ENV=production. Same value as shipment-tracking-job.yaml.
+            - name: DELHIVERY_API_BASE_URL
+              value: https://track.delhivery.com
+            - name: DELHIVERY_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: DELHIVERY_API_TOKEN
+                  key: "1"
+            - name: DELHIVERY_PICKUP_LOCATION
+              valueFrom:
+                secretKeyRef:
+                  name: DELHIVERY_PICKUP_LOCATION
+                  key: "1"
+            # Not set yet, deliberately: DELHIVERY_SELLER_GST_TIN (15-character GSTIN) and DELHIVERY_HSN_CODE (4-8 digits)
+            # are mandatory before DELHIVERY_ENABLED can be "true" with the production host (readDelhiveryConfig).
+            # DELHIVERY_WEBHOOK_SECRET is read only when DELHIVERY_SCAN_PUSH_ENABLED=true, which stays off; do not mount a
+            # secret that does not exist yet, because a missing secret reference fails the whole deployment.
+            # Fallback state code for GST splitting when no seller GSTIN is set (src/services/payment.service.ts); the
+            # same value as payment-worker-job.yaml.
+            - name: GST_SELLER_STATE_CODE
+              value: "33"
           resources:
             limits:
               cpu: 1000m

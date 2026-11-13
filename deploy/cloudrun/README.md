@@ -1,10 +1,14 @@
 # Deploying the backend to Google Cloud Run
 
+> **Status:** this document describes the NEW project. Nothing in it has been executed yet: the APIs below are not
+> enabled, the Artifact Registry repository, service account, secrets and Cloud Run resources do not exist, and the
+> `chamaro` database is empty until the data migration is approved and finished. Do not deploy before that.
+
 The API runs on **Cloud Run** (service `chamaro-api`, region `asia-south1`, project
-`project-2e1ca4ee-4c62-4f01-a4c`) with a **Cloud SQL for MySQL 8.4** database (instance
-`free-trial-first-project`). Cloud Run's built-in Cloud SQL connection mounts the instance's Unix
+`project-d95e700a-8cd9-4c1a-bd5`) with a **Cloud SQL for MySQL 8.4** database (instance
+`chamaro-mysql-prod`). Cloud Run's built-in Cloud SQL connection mounts the instance's Unix
 socket, so `DATABASE_URL` has the form
-`mysql://user:pass@localhost/db?socket=/cloudsql/project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project`
+`mysql://user:pass@localhost/db?socket=/cloudsql/project-d95e700a-8cd9-4c1a-bd5:asia-south1:chamaro-mysql-prod`
 (see `src/plugins/prisma.ts`). There is no proxy sidecar.
 
 | File | Purpose |
@@ -16,21 +20,71 @@ socket, so `DATABASE_URL` has the form
 | `deploy/cloudrun/payment-worker-job.yaml` | Cloud Run job `chamaro-payment-worker`: reconciles Razorpay payments and expires unpaid orders. |
 | `deploy/cloudrun/email-outbox-job.yaml` | Cloud Run job `chamaro-email-outbox`: retries the email outbox (API image, one pass, then exit). |
 
-Images live in `asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images`
+Images live in `asia-south1-docker.pkg.dev/project-d95e700a-8cd9-4c1a-bd5/chamaro-images`
 (`chamaro-api`, `chamaro-migrate`), tagged with the short Git commit. Never deploy `latest`.
 
-Secrets (Secret Manager, read by the `chamaro-backend` service account): `DATABASE_URL`, `JWT_SECRET`,
+Secrets (Secret Manager, read by the `chamaro-backend` service account): `DATABASE_URL` (runtime, account
+`chamaro_app`), `DATABASE_URL_MIGRATE` (migration job only, account `chamaro_migrator`), `JWT_SECRET`,
 `CORS_ORIGIN`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`,
-`GOOGLE_FRONTEND_CALLBACK_URL`, `RESEND_API_KEY`, and `RESEND_FROM_EMAIL_DOMAIN` (version 1, the verified sender
-`Chamaro <no-reply@chamaro.com>`, read as `RESEND_FROM_EMAIL`). Plain settings: `APP_ENV`, `NODE_ENV`,
+`GOOGLE_FRONTEND_CALLBACK_URL`, `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`,
+`RAZORPAY_WEBHOOK_SECRET`, `DELHIVERY_API_TOKEN` and `DELHIVERY_PICKUP_LOCATION`. The manifests pin the Resend, Razorpay and
+Delhivery secrets to `@1`, so create each of those as version 1. `RAZORPAY_ALLOW_LIVE_KEYS`, `DELHIVERY_ENABLED` and
+`DELHIVERY_AUTO_BOOKING` are `"false"` in every manifest until live payments and dispatch are deliberately approved.
+`RESEND_FROM_EMAIL` is the verified sender `Chamaro <no-reply@chamaro.com>`. Plain settings: `APP_ENV`, `NODE_ENV`,
 `HOST`, `APP_BASE_URL` (`https://chamaro.com`), optional `PASSWORD_RESET_TOKEN_TTL_MINUTES` (5-120, default 30).
+
+## One-time setup in the new project (not yet performed)
+
+Each step creates a billable or permission-bearing resource and needs explicit approval first.
+
+```sh
+P=project-d95e700a-8cd9-4c1a-bd5; R=asia-south1
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com   secretmanager.googleapis.com cloudscheduler.googleapis.com --project $P
+gcloud artifacts repositories create chamaro-images --repository-format=docker --location=$R --project $P
+gcloud iam service-accounts create chamaro-backend --project $P
+SA=chamaro-backend@$P.iam.gserviceaccount.com
+gcloud projects add-iam-policy-binding $P --member=serviceAccount:$SA --role=roles/cloudsql.client
+# Secret Manager: create each secret listed above (values never go in this repo), then:
+#   gcloud secrets add-iam-policy-binding <NAME> --project $P --member=serviceAccount:$SA --role=roles/secretmanager.secretAccessor
+```
+
+Database accounts: `chamaro_app` (runtime, SELECT/INSERT/UPDATE/DELETE via `chamaro_app_role`) already exists.
+`deploy/cloudrun/sql/create-migrator.sql` is a DRAFT for the separate `chamaro_migrator` account that
+`prisma migrate deploy` needs (CREATE/ALTER/DROP/INDEX/REFERENCES). Review it and run it yourself as an admin user.
+
+DATABASE_URL values use the Cloud SQL socket form, URL-encoding any special characters in the password:
+`mysql://chamaro_app:<password>@localhost/chamaro?socket=/cloudsql/project-d95e700a-8cd9-4c1a-bd5:asia-south1:chamaro-mysql-prod`
+(`DATABASE_URL_MIGRATE` is the same with `chamaro_migrator`).
+
+## Health checks
+
+- `GET /health` -- liveness; does not touch the database (used by the Cloud Build smoke test).
+- `GET /health/ready` -- readiness; runs `SELECT 1` and answers `503` with a generic message if the database is
+  unreachable. Never includes connection details.
+
+## Admin and storefront
+
+`admin` (static export served by `serve`) and `webapp` (`next start`) are separate images built from their own repos.
+`NEXT_PUBLIC_API_URL` is public and baked in at build time (default `https://api.chamaro.com/api/v1`); no secret may
+ever use a `NEXT_PUBLIC_` name. For each repo:
+
+```sh
+TAG=$(git rev-parse --short HEAD)
+IMAGE=$R-docker.pkg.dev/$P/chamaro-images/chamaro-<admin|webapp>:$TAG
+gcloud builds submit --project $P --region $R --config cloudbuild.yaml --substitutions _IMAGE=$IMAGE .
+gcloud run deploy chamaro-<admin|webapp> --project $P --region $R --image $IMAGE   --min-instances 0 --max-instances 2 --memory 512Mi --cpu 1 --port 8080
+```
+
+To test before `api.chamaro.com` is repointed, build with `--substitutions _IMAGE=...,_API_URL=https://<api run.app url>/api/v1`
+and add the test frontend origins to the `CORS_ORIGIN` secret. The Google OAuth state cookie is host-bound, so the
+real OAuth flow must be tested on the final API host.
 
 ## Each release
 
 Run from a clean working tree on the commit being released.
 
 ```sh
-P=project-2e1ca4ee-4c62-4f01-a4c; R=asia-south1
+P=project-d95e700a-8cd9-4c1a-bd5; R=asia-south1
 TAG=$(git rev-parse --short HEAD)
 REPO=$R-docker.pkg.dev/$P/chamaro-images
 
@@ -45,8 +99,8 @@ gcloud run jobs replace /tmp/migrate-job.yaml --project $P --region $R
 gcloud run jobs execute chamaro-migrate --project $P --region $R --wait --args=migrate,status
 #    Then read the execution's logs in Cloud Logging.
 
-# 4. Only if migrations are pending: take a backup first, then apply them.
-gcloud sql backups create --project $P --instance free-trial-first-project --description "before $TAG"
+# 4. Only if migrations are pending: take an on-demand backup of THIS instance first, then apply them.
+gcloud sql backups create --project $P --instance chamaro-mysql-prod --description "before $TAG"
 gcloud run jobs execute chamaro-migrate --project $P --region $R --wait
 
 # 5. New revision with no traffic; every other live setting and secret reference is kept.

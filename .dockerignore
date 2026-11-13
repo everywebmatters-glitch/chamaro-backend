@@ -4,13 +4,9 @@ generated
 .env
 .env.*
 client_secret_*.json
+*.pem
+*.key
 certs
 tests
 .git
-cd
-cls
-findstr
-gcloud
-npm
-powershell
-type
+.claude

@@ -1,7 +1,9 @@
 # Cloud Run job that applies Prisma migrations to the production database. Create or update it with
 #   gcloud run jobs replace deploy/cloudrun/migrate-job.yaml --region asia-south1
-# (after replacing <TAG> with the same commit tag as the API image). It uses the same service account, Cloud SQL
-# connection and DATABASE_URL secret as the chamaro-api service, so it migrates exactly the database the API uses.
+# (after replacing <TAG> with the same commit tag as the API image). It uses the same service account and Cloud SQL
+# connection as the chamaro-api service, so it migrates exactly the database the API uses, but it connects as the
+# separate chamaro_migrator account: the DATABASE_URL_MIGRATE secret is mapped to the DATABASE_URL variable that
+# prisma.config.ts reads. The runtime account chamaro_app has no DDL rights and is never used here.
 #
 # By default an execution runs `prisma migrate deploy` (applies pending migrations; never `migrate dev`, `db push`
 # or a reset). Check first without changing anything, by overriding the arguments for one execution:
@@ -16,26 +18,26 @@ spec:
   template:
     metadata:
       annotations:
-        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+        run.googleapis.com/cloudsql-instances: project-d95e700a-8cd9-4c1a-bd5:asia-south1:chamaro-mysql-prod
     spec:
       taskCount: 1
       parallelism: 1
       template:
         spec:
-          serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+          serviceAccountName: chamaro-backend@project-d95e700a-8cd9-4c1a-bd5.iam.gserviceaccount.com
           # A failed migration is never retried automatically; it needs a person to look at it.
           maxRetries: 0
           timeoutSeconds: 600
           containers:
             - name: migrate
-              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-migrate:<TAG>
+              image: asia-south1-docker.pkg.dev/project-d95e700a-8cd9-4c1a-bd5/chamaro-images/chamaro-migrate:<TAG>
               command: ["npx", "--no-install", "prisma"]
               args: ["migrate", "deploy"]
               env:
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef:
-                      name: DATABASE_URL
+                      name: DATABASE_URL_MIGRATE
                       key: latest
               resources:
                 limits:

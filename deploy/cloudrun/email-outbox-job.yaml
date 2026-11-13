@@ -19,18 +19,18 @@ spec:
   template:
     metadata:
       annotations:
-        run.googleapis.com/cloudsql-instances: project-2e1ca4ee-4c62-4f01-a4c:asia-south1:free-trial-first-project
+        run.googleapis.com/cloudsql-instances: project-d95e700a-8cd9-4c1a-bd5:asia-south1:chamaro-mysql-prod
     spec:
       taskCount: 1
       parallelism: 1
       template:
         spec:
-          serviceAccountName: chamaro-backend@project-2e1ca4ee-4c62-4f01-a4c.iam.gserviceaccount.com
+          serviceAccountName: chamaro-backend@project-d95e700a-8cd9-4c1a-bd5.iam.gserviceaccount.com
           maxRetries: 0
           timeoutSeconds: 300
           containers:
             - name: email-outbox
-              image: asia-south1-docker.pkg.dev/project-2e1ca4ee-4c62-4f01-a4c/chamaro-images/chamaro-api:<TAG>
+              image: asia-south1-docker.pkg.dev/project-d95e700a-8cd9-4c1a-bd5/chamaro-images/chamaro-api:<TAG>
               command: ["node"]
               args: ["dist/src/scripts/email-outbox-worker.js"]
               env:
@@ -50,7 +50,7 @@ spec:
                 - name: RESEND_FROM_EMAIL
                   valueFrom:
                     secretKeyRef:
-                      name: RESEND_FROM_EMAIL_DOMAIN
+                      name: RESEND_FROM_EMAIL
                       key: "1"
                 - name: CORS_ORIGIN
                   valueFrom:
