@@ -298,6 +298,25 @@ approval). They print a JSON summary, write `<path>.json` and `<path>.md` with `
 | `node dist/src/scripts/inventory-backfill.js [--apply]` | dry run | Converts each product to on-hand / reserved (available stock unchanged), classifies orders, opens the ledger. Products that don't reconcile are skipped and reported, never repaired. Re-running converges orders the previous code placed, shipped or cancelled since. |
 | `node dist/src/scripts/inventory-rollback.js [--apply]` | dry run | Returns migrated products to the legacy numbers exactly, then clears the ledger and order stock states (the JSON report keeps the ledger). Refused while variant-level stock exists. |
 
+### Release orphaned reservation (admin action; live with this stage)
+
+Migration `0021_stock_movement_orphan_release` (additive: one enum value appended, three nullable columns, one unique
+index) adds the `ORPHAN_RELEASE` ledger movement. Admins release reserved units that **no order holds** from the
+Inventory page ("Release orphaned reservation") or the API:
+
+- `GET  /api/v1/admin/inventory/products/:id/orphan-release`: current on hand / reserved / available, units held by
+  orders, releasable units, previous releases (read-only).
+- `POST /api/v1/admin/inventory/products/:id/orphan-releases` with
+  `{ quantity, expectedOnHand, expectedReserved, reason, reference }`: refused unless the stock row still shows the
+  expected numbers (409 `STALE_STOCK`), the quantity is within the units no order holds (409 `HELD_BY_ORDERS`,
+  `EXCEEDS_RESERVED`), the reason has 10–191 characters and the reference key was never used (409
+  `DUPLICATE_REFERENCE`). Changes `reservedQuantity` only, in one transaction with the ledger row.
+
+`ORPHAN_RELEASE` rows work on the legacy numbers: the backfill doesn't treat them as "already on the ledger" and
+carries the released units in the opening balance; reconciliation keeps such products in the legacy model; the
+rollback keeps these rows (audit trail) and removes the rest. There is no undo action: a reversal needs its own
+reviewed change.
+
 ## Notes
 
 - Swagger (`/docs`) is off in production. `/health` does not touch the database.

@@ -31,4 +31,9 @@ npm test
 ```
 
 `admin-provisioning` also expects at least one other ADMIN user to exist; seed one in the test database.
+
+`npm test` runs the files in parallel and several open pools of their own (concurrency tests model three API
+instances), peaking at about 175 connections. Give the throwaway MySQL room (the default `max_connections` is 151;
+over the limit, files are skipped as "database unreachable" and tests fail with `Too many connections`), e.g.
+`docker run ... mysql:8.4 --max-connections=300`.
 Every test file that can reach the database must use the guard; `unit/test-db-guard.test.ts` enforces that.

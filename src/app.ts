@@ -24,6 +24,7 @@ import { orderRoutes } from "./routes/order.routes.js";
 import { paymentRoutes } from "./routes/payment.routes.js";
 import { shipmentRoutes } from "./routes/shipment.routes.js";
 import { b2bEnquiryRoutes } from "./routes/b2b-enquiry.routes.js";
+import { inventoryRoutes } from "./routes/inventory.routes.js";
 
 // Proxies whose X-Forwarded-For entries are trusted, walking the header from the right (nearest hop first).
 // request.ip is the first address that is NOT one of these, so entries a client writes itself (further left) are never used.
@@ -68,5 +69,6 @@ export async function buildApp() {
   await app.register(paymentRoutes);
   await app.register(shipmentRoutes);
   await app.register(b2bEnquiryRoutes);
+  await app.register(inventoryRoutes);
   return app;
 }

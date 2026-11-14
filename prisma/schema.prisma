@@ -313,6 +313,8 @@ enum StockMovementKind {
   MIGRATION
   UNTRACKED_SALE
   POLICY_CHANGE
+  // Admin release of reserved units that no order holds (an orphaned reservation). Reserved only; on hand never changes.
+  ORPHAN_RELEASE
 }
 
 // Per-variant stock for products with stockLevel VARIANT (unused until the D4 mapping is approved).
@@ -344,6 +346,11 @@ model StockMovement {
   reservedDelta Int               @default(0)
   actorUserId   String?
   reason        String?           @db.VarChar(191)
+  // Admin corrections (ORPHAN_RELEASE): the client's idempotency/reference key (unique: a key is used once, ever) and
+  // the reserved units before and after, as read under the stock-row lock.
+  reference      String?          @unique @db.VarChar(80)
+  reservedBefore Int?
+  reservedAfter  Int?
   createdAt     DateTime          @default(now())
 
   @@unique([orderId, stockKey, kind])

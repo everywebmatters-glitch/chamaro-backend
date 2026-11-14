@@ -94,7 +94,10 @@ type ProductFacts = {
   reserved: number;
   lines: Line[];
   snapshot: { committedUnits: number } | null;
+  // Ledger rows other than ORPHAN_RELEASE (admin corrections, which can exist on legacy numbers).
   ledgerRows: number;
+  // Units released by ORPHAN_RELEASE rows on this stock key (they carry over into the opening balance).
+  orphanReleased: number;
   ledgeredOrderIds: Set<string>;
 };
 
@@ -103,13 +106,14 @@ async function readFacts(db: Reader, productId: string, name: string, row: { qua
   const lines = await orderLinesFor(db, productId);
   const snapshot = await db.inventoryMigration.findUnique({ where: { productId }, select: { committedUnits: true } });
   const key = productStockKey(productId);
-  const ledgerRows = await db.stockMovement.count({ where: { stockKey: key } });
+  const ledgerRows = await db.stockMovement.count({ where: { stockKey: key, kind: { not: "ORPHAN_RELEASE" } } });
+  const orphan = await db.stockMovement.aggregate({ where: { stockKey: key, kind: "ORPHAN_RELEASE" }, _sum: { reservedDelta: true } });
   const ledgered = await db.stockMovement.findMany({ where: { stockKey: key, orderId: { not: null }, kind: { in: ["MIGRATION", "RESERVE"] } }, select: { orderId: true } });
-  return { productId, name, quantity: Number(row.quantity), reserved: Number(row.reservedQuantity), lines, snapshot, ledgerRows, ledgeredOrderIds: new Set(ledgered.map((movement) => movement.orderId!)) };
+  return { productId, name, quantity: Number(row.quantity), reserved: Number(row.reservedQuantity), lines, snapshot, ledgerRows, orphanReleased: -(orphan._sum.reservedDelta ?? 0), ledgeredOrderIds: new Set(ledgered.map((movement) => movement.orderId!)) };
 }
 
 type Op =
-  | { type: "migrate"; committed: Line[]; open: Line[] }
+  | { type: "migrate"; committed: Line[]; open: Line[]; orphanReleased: number }
   | { type: "state"; orderIds: string[]; state: OrderClass }
   | { type: "adopt"; orderId: string; quantity: number; setReserved: boolean };
 
@@ -128,7 +132,8 @@ function decide(facts: ProductFacts, lockedOrderIds?: Set<string>): ProductResul
 
   if (!facts.snapshot) {
     // C2: a product already on the ledger without a snapshot (created or restocked by the new code) must never get a
-    // second opening balance.
+    // second opening balance. ORPHAN_RELEASE rows don't count: they are admin corrections made on the legacy numbers
+    // (already in the row), and the opening balance carries the units they released.
     if (facts.ledgerRows > 0) return { ...base, committedUnits: 0, mode: "skip", after: null, actions: [], problems: [`already on the ledger (${facts.ledgerRows} movement(s)) without a migration snapshot; not converted again`], ops: [] };
     const problems: string[] = [];
     const committedUnits = sum(committed);
@@ -140,8 +145,9 @@ function decide(facts: ProductFacts, lockedOrderIds?: Set<string>): ProductResul
     if (newReserved < 0) problems.push(`reserved would become negative (${newReserved})`);
     if (newOnHand < newReserved) problems.push(`on hand (${newOnHand}) would be below reserved (${newReserved})`);
     if (problems.length) return { ...base, mode: "skip", after: null, actions: [], problems, ops: [] };
-    const ops: Op[] = [{ type: "migrate", committed, open }];
+    const ops: Op[] = [{ type: "migrate", committed, open, orphanReleased: facts.orphanReleased }];
     const actions = [`convert: quantity ${quantity}→${newOnHand}, reserved ${reserved}→${newReserved} (${committedUnits} dispatched unit(s) taken off both)`];
+    if (facts.orphanReleased) actions.push(`opening balance carries ${facts.orphanReleased} unit(s) released earlier by admin (orphan release)`);
     for (const cls of ["RESERVED", "COMMITTED", "RELEASED"] as OrderClass[]) {
       const ids = lines.filter((line) => line.cls === cls && line.stockState === null).map((line) => line.orderId);
       if (ids.length) { ops.push({ type: "state", orderIds: ids, state: cls }); actions.push(`${ids.length} order(s) marked ${cls}`); }
@@ -177,6 +183,7 @@ async function execute(tx: Tx, facts: ProductFacts, ops: Op[]): Promise<string |
         oldReserved: facts.reserved,
         committedLines: op.committed.map(({ orderId, quantity }) => ({ orderId, quantity })),
         reservedLines: op.open.map(({ orderId, quantity }) => ({ orderId, quantity })),
+        releasedBeforeMigration: op.orphanReleased,
       });
       if (!done) return "stock changed while the backfill ran; run it again";
     } else if (op.type === "state") {
@@ -318,7 +325,8 @@ export async function reconcile(db: Reader, scope: Scope = {}): Promise<Reconcil
     const base = { productId: row.productId, name: row.product.name, quantity: row.quantity, reserved: row.reservedQuantity, available: row.quantity - row.reservedQuantity };
     if (row.quantity < 0 || row.reservedQuantity < 0) violations.push("negative stock value");
     const key = productStockKey(row.productId);
-    const ledgerRows = await db.stockMovement.count({ where: { stockKey: key } });
+    // ORPHAN_RELEASE rows alone don't put a product on the ledger (they are corrections of the legacy numbers).
+    const ledgerRows = await db.stockMovement.count({ where: { stockKey: key, kind: { not: "ORPHAN_RELEASE" } } });
     if (!migratedIds.has(row.productId) && ledgerRows === 0) {
       // Legacy model: reservedQuantity holds every order that was not cancelled (open and dispatched).
       const expectedReserved = sum(lines.filter((line) => line.cls !== "RELEASED"));

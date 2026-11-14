@@ -11,6 +11,8 @@ import { unitsPerProduct } from "../shared/order-pricing.js";
 //     admin product form use these.
 //  2. The ledger operations of the approved plan (reserveForOrder, releaseForOrder, commitForOrder, adjustStock,
 //     countStock). They are complete and tested but not called by any route or worker until the switch-over stage.
+//     Exception: releaseOrphanedReservation (admin route) is live in the expand stage; it works on the legacy numbers
+//     too and its ORPHAN_RELEASE rows are carried through the backfill and kept by the rollback.
 //
 // Rules shared by every stock write, old and new:
 //  - one conditional UPDATE per stock row, so the check and the change are a single atomic statement; a stock row
@@ -255,6 +257,115 @@ export async function countStock(tx: Tx, input: { key: StockKey; onHand: number;
   return readStockRow(tx, input.key);
 }
 
+// ---- orphaned reservations (admin correction; works in the legacy and the ledger model) --------------------------
+
+// Units of a product's reservedQuantity that belong to orders: the lines of every order that is not cancelled and whose
+// stock the ledger has not settled. stockState NULL is the legacy model, where reservedQuantity also keeps dispatched
+// orders (the backfill takes them off); RESERVED is held. COMMITTED, RELEASED and NONE orders hold nothing. A
+// cancelled order gave its units back in both models. Deliberately conservative: it may count an order the ledger has
+// not caught up with yet, never miss one, so a release can only ever be refused, not take units an order holds.
+export async function unitsHeldByOrders(db: Db, productId: string): Promise<number> {
+  const held = await db.retailOrderItem.aggregate({
+    where: { productId, order: { status: { not: "CANCELLED" }, OR: [{ stockState: null }, { stockState: "RESERVED" }] } },
+    _sum: { quantity: true },
+  });
+  return held._sum.quantity ?? 0;
+}
+
+export const ORPHAN_REASON_MIN = 10;
+export const ORPHAN_REASON_MAX = 191; // StockMovement.reason is VARCHAR(191)
+export const REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,79}$/;
+
+export type OrphanReleaseInput = {
+  productId: string;
+  quantity: number;
+  // What the admin saw when they decided: the release is refused if either number changed since (STALE_STOCK).
+  expectedOnHand: number;
+  expectedReserved: number;
+  reason: string;
+  // The client's idempotency key: used once, ever (the unique StockMovement.reference). A repeat is refused, not
+  // replayed, so a retried or double-clicked request can never release twice.
+  reference: string;
+  actorUserId: string;
+};
+
+export type OrphanReleaseResult = {
+  movement: { id: string; kind: "ORPHAN_RELEASE"; productId: string; quantity: number; reservedBefore: number; reservedAfter: number; onHandDelta: 0; actorUserId: string; reason: string; reference: string; createdAt: Date };
+  stock: { onHand: number; reserved: number; available: number };
+};
+
+// Release reserved units of a product-level stock row that no order holds (e.g. a reservation whose order was
+// deleted). The caller owns the transaction. Locks in the shared order (product FOR SHARE, then the stock row FOR
+// UPDATE; no order row is written), then, with both held, checks in this order: reference unused, the stock row still
+// shows what the admin saw, the quantity is within reservedQuantity, and within the units no order holds. One
+// conditional UPDATE changes reservedQuantity only (on hand is never touched), and one append-only ORPHAN_RELEASE
+// movement records who, why, how many, the reserved units before and after, and the reference. Any refusal throws
+// before or instead of the write, so the transaction rolls back with nothing changed.
+export async function releaseOrphanedReservation(tx: Tx, input: OrphanReleaseInput): Promise<OrphanReleaseResult> {
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (!Number.isSafeInteger(input.quantity) || input.quantity <= 0) throw httpError(400, "VALIDATION_ERROR", "The quantity to release must be a whole number of 1 or more");
+  if (reason.length < ORPHAN_REASON_MIN) throw httpError(400, "REASON_REQUIRED", `A reason of at least ${ORPHAN_REASON_MIN} characters is required`);
+  if (reason.length > ORPHAN_REASON_MAX) throw httpError(400, "VALIDATION_ERROR", `The reason can be at most ${ORPHAN_REASON_MAX} characters`);
+  if (typeof input.reference !== "string" || !REFERENCE_PATTERN.test(input.reference)) throw httpError(400, "VALIDATION_ERROR", "A reference key of 8 to 80 letters, digits, '.', '_', ':' or '-' is required");
+  if (!Number.isSafeInteger(input.expectedOnHand) || !Number.isSafeInteger(input.expectedReserved)) throw httpError(400, "VALIDATION_ERROR", "The expected on-hand and reserved units are required");
+  if (!input.actorUserId) throw new Error("releaseOrphanedReservation needs the acting admin");
+
+  // Locking reads first: the plain reads below then see every transaction that held these locks before us.
+  const products = await tx.$queryRaw<{ id: string; stockLevel: string }[]>`SELECT id, stockLevel FROM Product WHERE id = ${input.productId} FOR SHARE`;
+  if (products.length === 0) throw httpError(404, "NOT_FOUND", "Product not found");
+  if (products[0].stockLevel !== "PRODUCT") throw httpError(409, "VARIANT_LEVEL_STOCK", "This product keeps stock per variant; product-level reservations can't be released here");
+  const rows = await tx.$queryRaw<{ quantity: number; reservedQuantity: number }[]>`SELECT quantity, reservedQuantity FROM Inventory WHERE productId = ${input.productId} FOR UPDATE`;
+  if (rows.length === 0) throw httpError(404, "STOCK_NOT_FOUND", "This product has no stock record");
+  const onHand = Number(rows[0].quantity);
+  const reserved = Number(rows[0].reservedQuantity);
+
+  if (await tx.stockMovement.findUnique({ where: { reference: input.reference }, select: { id: true } })) throw httpError(409, "DUPLICATE_REFERENCE", "This request was already submitted (reference key used before); nothing was changed");
+  if (onHand !== input.expectedOnHand || reserved !== input.expectedReserved) throw httpError(409, "STALE_STOCK", `Stock changed since you opened it (now ${onHand} on hand, ${reserved} reserved); reload and check again`);
+  if (input.quantity > reserved) throw httpError(409, "EXCEEDS_RESERVED", `Only ${reserved} unit(s) are reserved`);
+  const held = await unitsHeldByOrders(tx, input.productId);
+  const releasable = Math.max(0, reserved - held);
+  if (input.quantity > releasable) throw httpError(409, "HELD_BY_ORDERS", `${held} of the ${reserved} reserved unit(s) belong to orders; at most ${releasable} can be released`);
+
+  const changed = await tx.$executeRaw`UPDATE Inventory SET reservedQuantity = reservedQuantity - ${input.quantity}, updatedAt = NOW(3) WHERE productId = ${input.productId} AND quantity = ${onHand} AND reservedQuantity = ${reserved} AND reservedQuantity >= ${input.quantity}`;
+  if (changed !== 1) throw new Error(`Stock row of ${input.productId} changed under its lock`);
+  const reservedAfter = reserved - input.quantity;
+  let movement;
+  try {
+    movement = await tx.stockMovement.create({
+      data: { kind: "ORPHAN_RELEASE", stockKey: productStockKey(input.productId), productId: input.productId, quantity: input.quantity, onHandDelta: 0, reservedDelta: -input.quantity, actorUserId: input.actorUserId, reason, reference: input.reference, reservedBefore: reserved, reservedAfter },
+    });
+  } catch (error) {
+    // A concurrent request with the same reference committed first (the unique index is the final guard).
+    if ((error as { code?: string }).code === "P2002") throw httpError(409, "DUPLICATE_REFERENCE", "This request was already submitted (reference key used before); nothing was changed");
+    throw error;
+  }
+  return {
+    movement: { id: movement.id, kind: "ORPHAN_RELEASE", productId: input.productId, quantity: input.quantity, reservedBefore: reserved, reservedAfter, onHandDelta: 0, actorUserId: input.actorUserId, reason, reference: input.reference, createdAt: movement.createdAt },
+    stock: { onHand, reserved: reservedAfter, available: onHand - reservedAfter },
+  };
+}
+
+// What the admin dialog shows before a release: the stock row, the units orders hold, what could be released, and
+// the product's previous releases (the audit trail). Plain reads only.
+export async function orphanReleaseView(db: Db, productId: string) {
+  const product = await db.product.findUnique({ where: { id: productId }, select: { id: true, name: true, stockLevel: true, inventory: { select: { quantity: true, reservedQuantity: true, updatedAt: true } } } });
+  if (!product) throw httpError(404, "NOT_FOUND", "Product not found");
+  const history = await db.stockMovement.findMany({ where: { kind: "ORPHAN_RELEASE", productId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 50, select: { id: true, quantity: true, reservedBefore: true, reservedAfter: true, actorUserId: true, reason: true, reference: true, createdAt: true } });
+  const actorIds = [...new Set(history.map((row) => row.actorUserId).filter((id): id is string => Boolean(id)))];
+  const actors = new Map((await db.user.findMany({ where: { id: { in: actorIds } }, select: { id: true, name: true } })).map((user) => [user.id, user.name]));
+  const stock = product.inventory;
+  const held = stock ? await unitsHeldByOrders(db, productId) : 0;
+  return {
+    productId: product.id,
+    name: product.name,
+    stockLevel: product.stockLevel,
+    stock: stock ? { onHand: stock.quantity, reserved: stock.reservedQuantity, available: stock.quantity - stock.reservedQuantity, updatedAt: stock.updatedAt } : null,
+    heldByOrders: held,
+    releasable: stock && product.stockLevel === "PRODUCT" ? Math.max(0, stock.reservedQuantity - held) : 0,
+    history: history.map((row) => ({ ...row, actorName: row.actorUserId ? actors.get(row.actorUserId) ?? null : null })),
+  };
+}
+
 // ---- 3. migration writes (used only by src/services/inventory-migration.ts) ----------------------------------------
 // The backfill converts a product from the legacy numbers (quantity = units ever received, reservedQuantity also
 // holding dispatched units) to the approved model (quantity = on hand, reservedQuantity = held for undispatched
@@ -266,6 +377,10 @@ export type ProductMigrationInput = {
   oldReserved: number;
   committedLines: { orderId: string; quantity: number }[];
   reservedLines: { orderId: string; quantity: number }[];
+  // Units admins released (ORPHAN_RELEASE) while the product was still on the legacy numbers. Those movements are
+  // already on the ledger with reservedDelta -n; the opening balance carries the units they released (+n, no order)
+  // so the ledger still sums to the stock row. 0 for a product that never had one.
+  releasedBeforeMigration?: number;
 };
 
 // Applies one product's conversion. The UPDATE only matches the exact numbers the plan was made from, so a change by
@@ -284,6 +399,7 @@ export async function migrateProductStock(tx: Tx, input: ProductMigrationInput):
       { kind: "MIGRATION", stockKey: key, productId: input.productId, quantity: newOnHand, onHandDelta: newOnHand, reason: "opening balance (on hand)" },
       ...input.reservedLines.map((line) => ({ kind: "MIGRATION" as const, stockKey: key, productId: input.productId, orderId: line.orderId, quantity: line.quantity, reservedDelta: line.quantity, reason: "reserved before migration" })),
       ...input.committedLines.map((line) => ({ kind: "MIGRATION" as const, stockKey: key, productId: input.productId, orderId: line.orderId, quantity: line.quantity, reason: "dispatched before migration" })),
+      ...(input.releasedBeforeMigration ? [{ kind: "MIGRATION" as const, stockKey: key, productId: input.productId, quantity: input.releasedBeforeMigration, reservedDelta: input.releasedBeforeMigration, reason: "reserved before migration, released by admin (orphan release)" }] : []),
     ],
   });
   return true;
@@ -337,7 +453,9 @@ export async function planLegacyRestore(db: Db, productId: string, options: { lo
   }
   if (!row) throw new Error(`No stock row for product ${productId}`);
   const snapshot = await db.inventoryMigration.findUnique({ where: { productId } });
-  const movements = await db.stockMovement.findMany({ where: { stockKey: key }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+  // ORPHAN_RELEASE rows stay: they are the audit trail of an admin correction whose effect is already in the row and
+  // means the same in the legacy model, so the rollback neither undoes nor deletes them.
+  const movements = await db.stockMovement.findMany({ where: { stockKey: key, kind: { not: "ORPHAN_RELEASE" } }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
   const committedSince = -movements.filter((movement) => movement.kind === "COMMIT").reduce((total, movement) => total + movement.onHandDelta, 0);
   const committedBefore = snapshot?.committedUnits ?? 0;
   const add = committedBefore + committedSince;
@@ -354,7 +472,7 @@ export async function applyLegacyRestore(tx: Tx, plan: LegacyRestorePlan): Promi
     const deleted = await tx.stockMovement.deleteMany({ where: { id: { in: ids } } });
     if (deleted.count !== ids.length) throw new Error(`Expected to delete ${ids.length} archived ledger row(s) of ${plan.productId}, deleted ${deleted.count}`);
   }
-  const left = await tx.stockMovement.count({ where: { stockKey: productStockKey(plan.productId) } });
+  const left = await tx.stockMovement.count({ where: { stockKey: productStockKey(plan.productId), kind: { not: "ORPHAN_RELEASE" } } });
   if (left !== 0) throw new Error(`${left} ledger row(s) of ${plan.productId} were not in the archive; nothing was restored`);
   if (plan.snapshot) {
     const removed = await tx.inventoryMigration.deleteMany({ where: { id: plan.snapshot.id } });
@@ -367,7 +485,8 @@ export async function applyLegacyRestore(tx: Tx, plan: LegacyRestorePlan): Promi
 export type LedgerClearPlan = { movements: LegacyRestorePlan["movements"]; orderIds: string[] };
 
 export async function planLedgerClear(db: Db, only?: string[]): Promise<LedgerClearPlan> {
-  const movements = await db.stockMovement.findMany({ where: only ? { productId: { in: only } } : {}, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
+  // ORPHAN_RELEASE rows are kept (see planLegacyRestore).
+  const movements = await db.stockMovement.findMany({ where: { kind: { not: "ORPHAN_RELEASE" }, ...(only ? { productId: { in: only } } : {}) }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] });
   const orders = await db.retailOrder.findMany({ where: { stockState: { not: null }, ...(only ? { items: { some: { productId: { in: only } } } } : {}) }, select: { id: true }, orderBy: { id: "asc" } });
   return { movements, orderIds: orders.map((order) => order.id) };
 }
