@@ -47,6 +47,11 @@ const verifiedResponseSchema = {
   },
 };
 
+export const registerSendOtpRouteSchema = routeSchema(["Authentication"], "Email a sign-up verification code (required by POST /auth/register)", {
+  body: sendOtpBody,
+  response: { 200: genericMessageResponseSchema },
+});
+
 export const sendLoginOtpRouteSchema = routeSchema(["Authentication"], "Send a one-time login code by email", {
   body: sendOtpBody,
   response: { 200: genericMessageResponseSchema },

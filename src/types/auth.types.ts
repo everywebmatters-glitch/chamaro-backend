@@ -4,6 +4,8 @@ export interface RegisterInput {
   name: string;
   email: string;
   password: string;
+  // Sign-up code from POST /auth/register/send-otp
+  otp: string;
 }
 
 export interface LoginInput {

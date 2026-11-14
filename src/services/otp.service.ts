@@ -31,8 +31,10 @@ export function createOtpService(prisma: PrismaClient) {
   return {
     // Generates, hashes, stores, and emails a new OTP, invalidating any previously active code
     // for the same email+purpose first. Enforces the resend cooldown against the most recently
-    // issued code (consumed or not). Never returns or logs the plaintext code.
-    async sendOtp(params: { email: string; purpose: OtpPurpose; userId?: string }): Promise<void> {
+    // issued code (consumed or not). Never returns or logs the plaintext code. `deliver` replaces the
+    // code email for callers that must record a send (same cooldown, same timing) without revealing
+    // the code, e.g. sign-up for an email that already has an account.
+    async sendOtp(params: { email: string; purpose: OtpPurpose; userId?: string; deliver?: () => Promise<void> }): Promise<void> {
       const email = params.email.trim().toLowerCase();
       const latest = await repository.findLatest(email, params.purpose);
       if (latest) {
@@ -46,27 +48,38 @@ export function createOtpService(prisma: PrismaClient) {
       const expiresAt = new Date(Date.now() + env.OTP_EXPIRY_MINUTES * 60_000);
       await repository.invalidateActive(email, params.purpose);
       await repository.create({ email, purpose: params.purpose, otpHash, expiresAt, userId: params.userId });
-      await sendOtpEmail(email, otp, params.purpose);
+      await (params.deliver ? params.deliver() : sendOtpEmail(email, otp, params.purpose));
     },
 
     // Validates `otp` against the latest active (unconsumed) code for email+purpose. On
-    // mismatch, increments the shared attempt counter and throws OTP_INVALID. On match, marks
+    // mismatch, the guess counts against the code and OTP_INVALID is thrown. On match, marks
     // the code consumed only when `consume` is true (default) -- pass false for a non-final
     // "check" step (e.g. forgot-password's verify-otp) whose later step (reset) re-validates
     // and performs the actual consumption. Returns the matched code's id (an identifier for this verification,
     // never the code itself).
+    //
+    // Concurrency: every guess first reserves one of the code's OTP_MAX_ATTEMPTS in a conditional write, and the
+    // code is consumed with another (only while unused). So parallel requests can neither compare more guesses than
+    // allowed nor both use the same code: exactly one wins, the rest are refused (OTP_INVALID; with more than
+    // OTP_MAX_ATTEMPTS requests in flight at once, the extra ones get OTP_MAX_ATTEMPTS because every guess is reserved).
+    // One request at a time behaves exactly as before: same error codes, a wrong guess counts once, a correct code
+    // doesn't count.
     async verifyOtp(params: { email: string; purpose: OtpPurpose; otp: string; consume?: boolean }): Promise<string> {
       const email = params.email.trim().toLowerCase();
       const record = await repository.findActive(email, params.purpose);
       if (!record) throw otpInvalid();
       if (record.expiresAt.getTime() < Date.now()) throw otpExpired();
       if (record.attempts >= env.OTP_MAX_ATTEMPTS) throw otpMaxAttempts();
-      const matches = await verifyPassword(params.otp, record.otpHash);
-      if (!matches) {
-        await repository.incrementAttempts(record.id);
-        throw otpInvalid();
+      if ((await repository.reserveAttempt(record.id, env.OTP_MAX_ATTEMPTS)) !== 1) {
+        // Lost a race: the code was used or replaced (invalid), or its last guess went to another request.
+        const current = await repository.findById(record.id);
+        throw !current || current.consumedAt ? otpInvalid() : otpMaxAttempts();
       }
-      if (params.consume ?? true) await repository.markConsumed(record.id);
+      const matches = await verifyPassword(params.otp, record.otpHash);
+      // A wrong guess keeps its reservation: it is the counted attempt.
+      if (!matches) throw otpInvalid();
+      await repository.releaseAttempt(record.id);
+      if ((params.consume ?? true) && (await repository.consumeIfActive(record.id)) !== 1) throw otpInvalid();
       return record.id;
     },
   };

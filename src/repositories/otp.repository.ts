@@ -15,9 +15,21 @@ export function createOtpRepository(prisma: PrismaClient) {
     invalidateActive: (email: string, purpose: OtpPurpose) =>
       prisma.emailOtp.updateMany({ where: { email, purpose, consumedAt: null }, data: { consumedAt: new Date() } }),
 
-    incrementAttempts: (id: string) => prisma.emailOtp.update({ where: { id }, data: { attempts: { increment: 1 } } }),
+    findById: (id: string) => prisma.emailOtp.findUnique({ where: { id } }),
 
-    markConsumed: (id: string) => prisma.emailOtp.update({ where: { id }, data: { consumedAt: new Date() } }),
+    // Takes one guess from the code's allowance in a single conditional write: only while the code is unused and has
+    // guesses left. Concurrent requests can therefore never compare more than `maxAttempts` guesses against one code.
+    // Returns how many rows changed (1 = reserved, 0 = no guesses left, or the code was used or replaced meanwhile).
+    reserveAttempt: async (id: string, maxAttempts: number) =>
+      (await prisma.emailOtp.updateMany({ where: { id, consumedAt: null, attempts: { lt: maxAttempts } }, data: { attempts: { increment: 1 } } })).count,
+
+    // Gives back a reserved guess when the code matched, so a correct code never counts as a wrong guess.
+    releaseAttempt: (id: string) => prisma.emailOtp.updateMany({ where: { id, attempts: { gt: 0 } }, data: { attempts: { decrement: 1 } } }),
+
+    // Marks the code used only while it is still unused, in one conditional write, so of two concurrent requests with
+    // the same correct code exactly one succeeds. Returns how many rows changed (1 = this request used it).
+    consumeIfActive: async (id: string) =>
+      (await prisma.emailOtp.updateMany({ where: { id, consumedAt: null }, data: { consumedAt: new Date() } })).count,
   };
 }
 

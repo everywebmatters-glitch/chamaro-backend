@@ -60,6 +60,11 @@ function frontendCallbackUrl(params: Record<string, string>): string {
 
 export function createAuthController(service: AuthService, sessions: SessionService) {
   return {
+    async registerSendOtp(request: FastifyRequest) {
+      await service.sendRegistrationOtp((request.body as { email: string }).email);
+      return { success: true, data: { message: "Check your email for a verification code to finish creating your account." } };
+    },
+
     async register(request: FastifyRequest, reply: FastifyReply) {
       const user: SafeUser = await service.register(request.body as RegisterInput);
       reply.code(201);

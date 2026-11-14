@@ -181,6 +181,31 @@ export function passwordChangedEmail(input: { name: string; changedAt: Date; res
   };
 }
 
+// ---- sign-up for an email that already has an account ---------------------------------------------------------------
+
+// Sent in place of a sign-up code, so the sign-up form answers the same way whether or not the email is registered.
+// It carries no code.
+export function accountExistsEmail(loginUrl: string, resetUrl: string): EmailMessage {
+  return {
+    subject: "You already have a Chamaro account",
+    html: layout(`<p style="${TEXT}">Someone tried to create a Chamaro account with this email address, but you already have one.</p>
+      <a href="${escapeHtml(loginUrl)}" style="${BUTTON}">Log in</a>
+      <p style="${MUTED}">Forgot your password? <a href="${escapeHtml(resetUrl)}" style="color:#1f1b16;">Reset it here</a>.</p>
+      <p style="${LAST}">If this wasn't you, you can ignore this email; nothing about your account has changed.</p>`),
+    text: textLayout([
+      "Someone tried to create a Chamaro account with this email address, but you already have one.",
+      `Log in here:\n${loginUrl}`,
+      `Forgot your password? Reset it here:\n${resetUrl}`,
+      "If this wasn't you, you can ignore this email; nothing about your account has changed.",
+    ]),
+  };
+}
+
+// Sent directly, like the sign-up code it stands in for (same failure message), so both cases fail the same way.
+export async function sendAccountExistsEmail(to: string, loginUrl: string, resetUrl: string): Promise<void> {
+  await deliverEmail(to, accountExistsEmail(loginUrl, resetUrl), { failureMessage: "Failed to send verification email" });
+}
+
 // ---- orders ------------------------------------------------------------------------------------------------------
 
 export type OrderEmailItem = { productName: string | null; variantName: string | null; quantity: number; lineTotal: string };
