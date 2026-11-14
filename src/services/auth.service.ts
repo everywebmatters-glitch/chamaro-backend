@@ -8,7 +8,7 @@ import { hashPassword, verifyPasswordConstantWork } from "../utils/password.js";
 import { createAuthRepository } from "../repositories/auth.repository.js";
 import { createPasswordResetRepository } from "../repositories/password-reset.repository.js";
 import { createOtpService } from "./otp.service.js";
-import { passwordChangedEmail, sendPasswordResetLinkEmail } from "./email.service.js";
+import { passwordChangedEmail, sendAccountExistsEmail, sendPasswordResetLinkEmail } from "./email.service.js";
 import { createEmailOutbox, enqueueNotification } from "./email-outbox.service.js";
 import { googleProvider } from "../providers/google.provider.js";
 import type { AdminLoginInput, GoogleIdentity, LoginInput, RegisterInput, SafeUser } from "../types/auth.types.js";
@@ -46,9 +46,19 @@ function resetTokenInvalid(): Error {
   return Object.assign(new Error("This reset link is invalid or has expired; request a new one"), { statusCode: 400, code: "RESET_TOKEN_INVALID" });
 }
 
-// Longer than a normal token write plus email send, so a request for a real account takes as long as one for an
-// unknown email.
-const RESET_LINK_MIN_RESPONSE_MS = 1500;
+// Longer than a normal token or code write plus email send, so a request for a real account takes as long as one
+// for an unknown email.
+const MIN_RESPONSE_MS = 1500;
+
+async function withMinimumDuration(run: () => Promise<void>): Promise<void> {
+  const started = Date.now();
+  try {
+    await run();
+  } finally {
+    const remaining = MIN_RESPONSE_MS - (Date.now() - started);
+    if (remaining > 0) await sleep(remaining);
+  }
+}
 
 // Reset tokens are 256 random bits, so a fast unsalted SHA-256 is enough to make the stored value useless
 // to anyone who reads the table; it also lets the token be looked up by its hash. An admin's token is hashed under
@@ -148,12 +158,34 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
   }
 
   return {
+    // Step 1 of sign-up. A new email gets a code. An email that already has an account gets sign-in help instead
+    // (an active customer) or nothing (an admin or inactive account), but every case records a send, so the
+    // resend cooldown, the answer and (with MIN_RESPONSE_MS) the timing are the same: the form never reveals
+    // whether an email is registered.
+    async sendRegistrationOtp(email: string): Promise<void> {
+      await withMinimumDuration(async () => {
+        const normalized = email.trim().toLowerCase();
+        const user = await repository.findByEmail(normalized);
+        const deliver = !user
+          ? undefined
+          : user.isActive && user.role === "CUSTOMER"
+            ? () => sendAccountExistsEmail(user.email, `${env.APP_BASE_URL}/account/login`, `${env.APP_BASE_URL}/account/login?reset=1`)
+            : async () => {};
+        await otpService.sendOtp({ email: normalized, purpose: "EMAIL_VERIFICATION", deliver });
+      });
+    },
+
+    // Step 2 of sign-up. The code is checked and used up (atomically: one request wins) before anything is created, so
+    // an account only exists for an address whose owner read the code, and it starts verified: order and password
+    // emails reach it, and Google sign-in can link to it. A registered email never receives a code, so a duplicate
+    // sign-up fails here with OTP_INVALID rather than revealing that the account exists.
     async register(input: RegisterInput): Promise<SafeUser> {
       const email = input.email.trim().toLowerCase();
+      await otpService.verifyOtp({ email, purpose: "EMAIL_VERIFICATION", otp: input.otp });
       const passwordHash = await hashPassword(input.password);
       // role is always CUSTOMER -- never taken from input, and the request schema
       // (additionalProperties: false) rejects a client-supplied "role" before we get here.
-      return repository.createCustomer({ name: input.name.trim(), email, passwordHash });
+      return repository.createVerifiedCustomer({ name: input.name.trim(), email, passwordHash });
     },
 
     async login(input: LoginInput) {
@@ -265,15 +297,9 @@ export function createAuthService(prisma: PrismaClient, options: { log?: Fastify
     // Emails a single-use reset link to an active account: customers' link opens the storefront, admins' the admin
     // app. Every other case, a send within the resend cooldown, and a failed email
     // all return the same way, so the caller can't tell whether the email has an account. Every answer also takes
-    // at least RESET_LINK_MIN_RESPONSE_MS, so the time spent issuing and emailing a link doesn't give it away either.
+    // at least MIN_RESPONSE_MS, so the time spent issuing and emailing a link doesn't give it away either.
     async requestPasswordResetLink(email: string): Promise<void> {
-      const started = Date.now();
-      try {
-        await issuePasswordResetLink(email);
-      } finally {
-        const remaining = RESET_LINK_MIN_RESPONSE_MS - (Date.now() - started);
-        if (remaining > 0) await sleep(remaining);
-      }
+      await withMinimumDuration(() => issuePasswordResetLink(email));
     },
 
     async resetPasswordWithToken(token: string, newPassword: string): Promise<void> {

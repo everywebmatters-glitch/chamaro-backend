@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { isolatedDatabaseSkipReason } from "../helpers/throwaway-db.js";
+import { captureEmails, codeFrom, registerWithCode } from "../helpers/signup.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, scrypt as scryptCallback } from "node:crypto";
@@ -21,8 +22,8 @@ test("customer registration and login", { skip: skipReason }, async () => {
   const password = "customer-password-123";
   let userId: string | undefined;
   try {
-    // 13. register -> 201, 14. registered user has CUSTOMER role
-    const register = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "New Customer", email, password } });
+    // 13. register (with the emailed sign-up code) -> 201, 14. registered user has CUSTOMER role
+    const register = await registerWithCode(app, { name: "New Customer", email, password });
     assert.equal(register.statusCode, 201);
     const registered = register.json().data;
     assert.equal(registered.role, "CUSTOMER");
@@ -32,18 +33,29 @@ test("customer registration and login", { skip: skipReason }, async () => {
     userId = registered.id;
 
     // 15. role field in body -> 400
-    const withRole = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Other", email: `role-${suffix}@example.test`, password, role: "ADMIN" } });
+    const withRole = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Other", email: `role-${suffix}@example.test`, password, otp: "123456", role: "ADMIN" } });
     assert.equal(withRole.statusCode, 400);
     assert.equal(withRole.json().error.code, "VALIDATION_ERROR");
 
-    const withSuperAdmin = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Other", email: `role2-${suffix}@example.test`, password, role: "SUPER_ADMIN" } });
+    const withSuperAdmin = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Other", email: `role2-${suffix}@example.test`, password, otp: "123456", role: "SUPER_ADMIN" } });
     assert.equal(withSuperAdmin.statusCode, 400);
     assert.equal(withSuperAdmin.json().error.code, "VALIDATION_ERROR");
 
-    // 16. duplicate registration -> 409
-    const duplicate = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Duplicate", email, password } });
-    assert.equal(duplicate.statusCode, 409);
-    assert.equal(duplicate.json().error.code, "DUPLICATE_RECORD");
+    // 16. duplicate registration: the registered email is sent sign-in help instead of a code, so the
+    // sign-up attempt fails at the code check (400 OTP_INVALID) without revealing that the account exists.
+    // Step past the resend cooldown left by this email's sign-up code a moment ago.
+    await app.prisma.emailOtp.updateMany({ where: { email }, data: { createdAt: new Date(Date.now() - 10 * 60_000) } });
+    const emails = captureEmails();
+    try {
+      const sendForExisting = await app.inject({ method: "POST", url: "/api/v1/auth/register/send-otp", payload: { email } });
+      assert.equal(sendForExisting.statusCode, 200);
+      assert.equal(codeFrom(emails.sent.at(-1)), null, "no sign-up code goes to a registered email");
+    } finally {
+      emails.stop();
+    }
+    const duplicate = await app.inject({ method: "POST", url: "/api/v1/auth/register", payload: { name: "Duplicate", email, password, otp: "000000" } });
+    assert.equal(duplicate.statusCode, 400);
+    assert.equal(duplicate.json().error.code, "OTP_INVALID");
 
     // 17. customer login -> 200
     const login = await app.inject({ method: "POST", url: "/api/v1/auth/login", payload: { email, password } });
@@ -88,6 +100,7 @@ test("customer registration and login", { skip: skipReason }, async () => {
   } finally {
     if (userId) await app.prisma.user.delete({ where: { id: userId } }).catch(() => undefined);
     await app.prisma.user.deleteMany({ where: { email: { contains: suffix } } }).catch(() => undefined);
+    await app.prisma.emailOtp.deleteMany({ where: { email: { contains: suffix } } }).catch(() => undefined);
     await app.close();
   }
 });

@@ -11,9 +11,10 @@ export function createAuthRepository(prisma: PrismaClient) {
 
     findSafeById: (id: string) => prisma.user.findUnique({ where: { id }, select: safeUserSelect }),
 
-    // Self-registration always creates a RETAIL customer profile alongside the identity.
-    createCustomer: (data: { name: string; email: string; passwordHash: string }) =>
-      prisma.user.create({ data: { ...data, role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } }, select: safeUserSelect }),
+    // Self-registration always creates a RETAIL customer profile alongside the identity. Call it only after the address
+    // was proven (the sign-up code was verified and used up): the account starts verified, so notifications reach it.
+    createVerifiedCustomer: (data: { name: string; email: string; passwordHash: string }) =>
+      prisma.user.create({ data: { ...data, emailVerifiedAt: new Date(), role: "CUSTOMER", customer: { create: { customerType: "RETAIL" } } }, select: safeUserSelect }),
 
     // Google only signs in accounts whose address it has verified (see google.provider), so the address starts verified.
     createGoogleCustomer: (data: { name: string; email: string; googleId: string }) =>

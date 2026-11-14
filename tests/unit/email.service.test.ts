@@ -210,3 +210,36 @@ test("the OTP email keeps its subject and code", async () => {
   assert.ok(sent[0].html.includes(">042137</div>"));
   email.setEmailClientForTests(undefined);
 });
+
+test("the account-exists email links to log in and reset, escapes them, has a text part, and carries no code", async () => {
+  const message = email.accountExistsEmail("https://chamaro.com/account/login", "https://chamaro.com/account/login?reset=1&x=\"><script>");
+  assert.equal(message.subject, "You already have a Chamaro account");
+  assert.ok(message.html.includes('href="https://chamaro.com/account/login"'));
+  assert.ok(message.html.includes("reset=1&amp;x=&quot;&gt;&lt;script&gt;"));
+  assert.ok(!message.html.includes("<script>"));
+  assert.doesNotMatch(message.html, /\d{6}/);
+  assert.ok(message.text.includes("https://chamaro.com/account/login\n"));
+  assert.ok(message.text.includes("you already have one"));
+  assert.doesNotMatch(message.text, /\d{6}/);
+
+  const sent = fakeClient();
+  await email.sendAccountExistsEmail("a@example.test", "https://chamaro.com/account/login", "https://chamaro.com/account/login?reset=1");
+  assert.equal(sent[0].subject, "You already have a Chamaro account");
+  assert.equal(sent[0].to, "a@example.test");
+  assert.ok(sent[0].text.length > 0, "plain-text part is sent");
+  email.setEmailClientForTests(undefined);
+});
+
+test("a failed account-exists email fails exactly like a failed sign-up code email", async () => {
+  fakeClient(async () => ({ error: { name: "application_error", statusCode: 500 } }));
+  const failures = await Promise.all([
+    email.sendAccountExistsEmail("a@example.test", "https://chamaro.com/account/login", "https://chamaro.com/account/login?reset=1").then(() => null, (error) => error),
+    email.sendOtpEmail("a@example.test", "123456", "EMAIL_VERIFICATION").then(() => null, (error) => error),
+  ]);
+  for (const error of failures) {
+    assert.equal(error?.statusCode, 502);
+    assert.equal(error?.code, "EMAIL_SEND_FAILED");
+    assert.equal(error?.message, "Failed to send verification email");
+  }
+  email.setEmailClientForTests(undefined);
+});

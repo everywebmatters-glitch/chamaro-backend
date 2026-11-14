@@ -15,6 +15,7 @@ import {
   forgotPasswordResetRouteSchema,
   forgotPasswordSendOtpRouteSchema,
   forgotPasswordVerifyOtpRouteSchema,
+  registerSendOtpRouteSchema,
   resetPasswordWithTokenRouteSchema,
   sendLoginOtpRouteSchema,
   verifyLoginOtpRouteSchema,
@@ -39,6 +40,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   app.get("/api/v1/auth/google/callback", { schema: googleCallbackRouteSchema }, (request, reply) => controller.googleCallback(request, reply));
   app.post("/api/v1/auth/google/exchange", { ...authRateLimit, schema: googleExchangeRouteSchema }, (request, reply) => controller.googleExchange(request, reply));
 
+  // Sign-up is two steps: send-otp emails a code, register creates the account only with that code.
+  app.post("/api/v1/auth/register/send-otp", { ...otpRateLimit, schema: registerSendOtpRouteSchema }, (request) => controller.registerSendOtp(request));
   app.post("/api/v1/auth/register", { ...registerRateLimit, schema: registerRouteSchema }, (request, reply) => controller.register(request, reply));
   // Persistent customer session: renewed from an HttpOnly cookie, ended on logout. Own sites only (Origin is checked).
   const sessionRateLimit = { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } };

@@ -6,14 +6,17 @@ const emailProperty = { type: "string", format: "email" } as const;
 const newPasswordProperty = { type: "string", minLength: MIN_PASSWORD_LENGTH, maxLength: MAX_PASSWORD_LENGTH } as const;
 // Login accepts any previously-issued password length; strength is enforced at creation time, not at login.
 const loginPasswordProperty = { type: "string", minLength: 1, maxLength: MAX_PASSWORD_LENGTH } as const;
+const otpProperty = { type: "string", pattern: "^[0-9]{6}$" } as const;
 
 // `additionalProperties: false` is what makes an unexpected field (e.g. "role") a 400
 // VALIDATION_ERROR instead of being silently ignored -- see error.middleware.ts.
+// `otp` is the code emailed by POST /auth/register/send-otp: no account is created for an email
+// address its owner hasn't proven they can read.
 export const registerBody = {
   type: "object",
   additionalProperties: false,
-  required: ["name", "email", "password"],
-  properties: { name: nameProperty, email: emailProperty, password: newPasswordProperty },
+  required: ["name", "email", "password", "otp"],
+  properties: { name: nameProperty, email: emailProperty, password: newPasswordProperty, otp: otpProperty },
 };
 
 export const loginBody = {
